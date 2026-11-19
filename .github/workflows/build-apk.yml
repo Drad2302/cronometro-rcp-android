@@ -35,3 +35,11 @@ jobs:
         with:
           name: cronometro-rcp-apk
           path: app/build/outputs/apk/debug/*.apk
+      - name: Publicar APK em versão do GitHub
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1
+          name: Cronômetro RCP - versão 1
+          files: app/build/outputs/apk/debug/*.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
