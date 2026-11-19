@@ -199,5 +199,22 @@ fi
 if [ -f "app/src/main/AndroidManifest.xml" ]; then
   sed -i 's/@android:style\/Theme.Material.NoActionBar/@style\/Theme.CronometroRCP/g' app/src/main/AndroidManifest.xml
 fi
+python3 <<'PY'
+from pathlib import Path
 
+arquivo = Path("app/src/main/java/br/com/cronometrorcp/service/RcpForegroundService.kt")
+texto = arquivo.read_text(encoding="utf-8")
+
+antigo = "override fun onStop() = stopAndSaveSession()"
+novo = """override fun onStop() {
+        stopAndSaveSession()
+    }"""
+
+if antigo in texto:
+    texto = texto.replace(antigo, novo)
+    arquivo.write_text(texto, encoding="utf-8")
+    print("Correção do onStop aplicada.")
+else:
+    print("Aviso: padrão do onStop não encontrado.")
+PY
 echo "Projeto preparado com sucesso."
