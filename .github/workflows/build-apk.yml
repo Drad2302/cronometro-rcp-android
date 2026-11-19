@@ -1,42 +1,39 @@
-name: Gerar APK do Cronômetro RCP
+name: Gerar APK
 
 on:
   push:
     branches:
       - main
+
 permissions:
   contents: write
-  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Baixar código do repositório
+      - name: Baixar código
         uses: actions/checkout@v4
 
-      - name: Instalar Java 17
+      - name: Instalar Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
 
-      - name: Preparar projeto Android
-        run: |
-          chmod +x .github/scripts/preparar_projeto.sh
-          .github/scripts/preparar_projeto.sh
+      - name: Preparar projeto
+        run: bash .github/scripts/preparar_projeto.sh
 
-      - name: Compilar APK de teste
-        run: |
-          chmod +x gradlew
-          ./gradlew assembleDebug
+      - name: Gerar APK
+        run: ./gradlew assembleDebug
 
       - name: Publicar APK
         uses: actions/upload-artifact@v4
         with:
           name: cronometro-rcp-apk
           path: app/build/outputs/apk/debug/*.apk
+
       - name: Publicar APK em versão do GitHub
         uses: softprops/action-gh-release@v2
         with:
