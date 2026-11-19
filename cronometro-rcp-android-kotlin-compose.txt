@@ -1,0 +1,4412 @@
+================================================================================
+FILE: app/src/main/AndroidManifest.xml
+================================================================================
+
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Funcionamento 100% offline: nenhuma permissão de INTERNET declarada -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="Cronômetro RCP com Áudio"
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.Material.NoActionBar">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:screenOrientation="portrait">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".service.RcpForegroundService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
+    </application>
+</manifest>
+
+
+================================================================================
+FILE: app/src/main/java/br/com/cronometrorcp/service/RcpForegroundService.kt
+================================================================================
+
+package br.com.cronometrorcp.service
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.os.Binder
+import android.os.Build
+import android.os.IBinder
+import android.os.PowerManager
+import android.os.SystemClock
+import android.support.v4.media.session.MediaSessionCompat
+import android.support.v4.media.session.PlaybackStateCompat
+import androidx.core.app.NotificationCompat
+import androidx.media.app.NotificationCompat.MediaStyle
+import br.com.cronometrorcp.MainActivity
+import br.com.cronometrorcp.audio.RcpAudioEngine
+import br.com.cronometrorcp.data.RcpRepository
+import br.com.cronometrorcp.model.*
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import java.time.Instant
+
+class RcpForegroundService : Service() {
+
+    inner class LocalBinder : Binder() {
+        fun getService(): RcpForegroundService = this@RcpForegroundService
+    }
+
+    private val binder = LocalBinder()
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+
+    private lateinit var repository: RcpRepository
+    private lateinit var audioEngine: RcpAudioEngine
+    private lateinit var mediaSession: MediaSessionCompat
+    private var wakeLock: PowerManager.WakeLock? = null
+
+    private val _timerState = MutableStateFlow(RcpTimerState())
+    val timerState: StateFlow<RcpTimerState> = _timerState.asStateFlow()
+
+    private var timerJob: Job? = null
+    private var metronomeJob: Job? = null
+    private var mp3SyncJob: Job? = null
+
+    private var sessionStartedAtIso: String = ""
+    private var lastAnnouncementCycleRemaining: Int = -1
+    private var thirtySecondAnnouncedCycle: Int = -1
+    private var lastReminderElapsed = mutableMapOf<ReminderKey, Int>()
+    private var beatStepInPattern = 0
+    private var isForegroundActive = false
+
+    private var amiodaronaDose1Prompted = false
+    private var amiodaronaDose2Prompted = false
+    private var fiveHsInitialDone = false
+    private var fiveHsTipIndex = 0
+    private var lastFiveHsTipAt = 0
+    private var pendingFiveHsTip = false
+    private var lastCriticalSpeechAt = -99
+    private var isVentilationPhase = false
+    private var lastCompressorPreWarnAnchor = -1
+    private var lastAdrenalinaPreWarnAnchor = -1
+    private var ventilationWaitUntilMs = 0L
+    private var remainingVentPauseOnPauseMs = 0L
+    private var protectedSpeechUntilMs = 0L
+    private var pausedMp3PosMs: Int? = null
+    private var lastSyncSignature: String = ""
+    @Volatile
+    private var liveBeatOffsetMs: Int = 0
+
+    private fun estimateSpeechMs(text: String): Long {
+        val len = text.trim().length
+        return (len * 65L + 400L).coerceIn(1600L, 7000L)
+    }
+
+    private fun speakProtected(text: String, flushQueue: Boolean = false) {
+        if (text.isBlank()) return
+        val nowMs = SystemClock.elapsedRealtime()
+        val est = estimateSpeechMs(text)
+        protectedSpeechUntilMs = maxOf(if (flushQueue) nowMs else protectedSpeechUntilMs, nowMs + est)
+        audioEngine.speak(text, flushQueue = flushQueue)
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        repository = RcpRepository(this)
+        audioEngine = RcpAudioEngine(this)
+        audioEngine.updateAudioSettings(repository.loadAudioSettings())
+
+        createNotificationChannel()
+        mediaSession = MediaSessionCompat(this, "CronometroRcpMediaSession").apply {
+            setCallback(object : MediaSessionCompat.Callback() {
+                override fun onPlay() = resumeRcp()
+                override fun onPause() = pauseRcp()
+                override fun onStop() = stopAndSaveSession()
+            })
+            isActive = true
+        }
+
+        val initialMode = repository.loadSelectedMode()
+        val cfg = repository.loadModeConfigs()[initialMode]!!
+        _timerState.value = RcpTimerState(
+            activeMode = initialMode,
+            cycleRemainingSeconds = cfg.cycleDurationSeconds,
+            adrenalinaRemainingSeconds = cfg.reminders[ReminderKey.ADRENALINA]?.intervalSeconds
+        )
+    }
+
+    override fun onBind(intent: Intent?): IBinder = binder
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            ACTION_PAUSE -> pauseRcp()
+            ACTION_RESUME -> resumeRcp()
+            ACTION_STOP -> stopAndSaveSession()
+        }
+        return START_STICKY
+    }
+
+    fun selectMode(mode: RcpMode) {
+        if (_timerState.value.isRunning) return
+        repository.saveSelectedMode(mode)
+        val cfg = repository.loadModeConfigs()[mode]!!
+        _timerState.value = _timerState.value.copy(
+            activeMode = mode,
+            cycleRemainingSeconds = cfg.cycleDurationSeconds,
+            adrenalinaRemainingSeconds = cfg.reminders[ReminderKey.ADRENALINA]?.intervalSeconds,
+            currentPhaseLabel = "Pronto"
+        )
+    }
+
+    private fun buildSyncSignature(s: AudioSettings): String =
+        "${s.rhythmSource.name}:${s.mp3UriString}:${s.mp3ExactBpm}:${s.mp3OriginalBpm}:${s.mp3TrimStartMs}:${s.mp3LoopEndMs}:${s.mp3SyncSpeed}:${s.followMusicRhythm}"
+
+    fun refreshAudioSettings(settings: AudioSettings) {
+        liveBeatOffsetMs = settings.mp3BeatOffsetMs
+        val nextSig = buildSyncSignature(settings)
+        audioEngine.updateAudioSettings(settings)
+        val state = _timerState.value
+        if (state.isRunning && !state.isPaused && nextSig != lastSyncSignature) {
+            lastSyncSignature = nextSig
+            val cfg = repository.loadModeConfigs()[state.activeMode]!!
+            pausedMp3PosMs = if (audioEngine.isMp3PlayingNow()) audioEngine.getMp3PositionMs() else null
+            launchLoops(cfg)
+        }
+    }
+
+    fun startRcp() {
+        val mode = _timerState.value.activeMode
+        val cfg = repository.loadModeConfigs()[mode]!!
+        sessionStartedAtIso = Instant.now().toString()
+        lastAnnouncementCycleRemaining = -1
+        thirtySecondAnnouncedCycle = -1
+        lastReminderElapsed.clear()
+        beatStepInPattern = 0
+
+        amiodaronaDose1Prompted = false
+        amiodaronaDose2Prompted = false
+        fiveHsInitialDone = false
+        fiveHsTipIndex = 0
+        lastFiveHsTipAt = 0
+        pendingFiveHsTip = false
+        lastCriticalSpeechAt = 0
+        isVentilationPhase = false
+        lastCompressorPreWarnAnchor = -1
+        lastAdrenalinaPreWarnAnchor = -1
+        ventilationWaitUntilMs = 0L
+        remainingVentPauseOnPauseMs = 0L
+        protectedSpeechUntilMs = 0L
+        pausedMp3PosMs = null
+        val startAudioSettings = repository.loadAudioSettings()
+        liveBeatOffsetMs = startAudioSettings.mp3BeatOffsetMs
+        lastSyncSignature = buildSyncSignature(startAudioSettings)
+
+        _timerState.value = RcpTimerState(
+            isRunning = true,
+            isPaused = false,
+            activeMode = mode,
+            cycleNumber = 1,
+            cycleRemainingSeconds = cfg.cycleDurationSeconds,
+            totalElapsedSeconds = 0,
+            currentPhaseLabel = if (cfg.pattern.isContinuous) "Compressões contínuas" else "Compressões",
+            adrenalinaRemainingSeconds = cfg.reminders[ReminderKey.ADRENALINA]?.let {
+                if (it.enabled) it.intervalSeconds else null
+            },
+            adrenalinaDue = false,
+            isIntubated = false,
+            shocksCount = 0,
+            amiodaronaCount = 0,
+            currentFiveHsTsTip = null,
+            events = emptyList()
+        )
+
+        promoteToForeground()
+        acquireWakeLock()
+        updateMediaPlaybackState(isPlaying = true)
+
+        speakProtected("RCP iniciada. ${cfg.voiceMessages.compressionsCue}", flushQueue = true)
+        launchLoops(cfg)
+    }
+
+    fun pauseRcp() {
+        val current = _timerState.value
+        if (!current.isRunning || current.isPaused) return
+        if (ventilationWaitUntilMs > 0L) {
+            remainingVentPauseOnPauseMs = (ventilationWaitUntilMs - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+            ventilationWaitUntilMs = 0L
+        }
+        pausedMp3PosMs = if (audioEngine.isMp3PlayingNow()) audioEngine.getMp3PositionMs() else pausedMp3PosMs
+        timerJob?.cancel()
+        metronomeJob?.cancel()
+        mp3SyncJob?.cancel()
+        audioEngine.pauseMp3Loop()
+        _timerState.value = current.copy(isPaused = true)
+        updateMediaPlaybackState(isPlaying = false)
+        updateNotification()
+        audioEngine.speak("Cronômetro pausado.", flushQueue = true)
+    }
+
+    fun resumeRcp() {
+        val current = _timerState.value
+        if (!current.isRunning || !current.isPaused) return
+        if (remainingVentPauseOnPauseMs > 0L) {
+            ventilationWaitUntilMs = SystemClock.elapsedRealtime() + remainingVentPauseOnPauseMs
+            remainingVentPauseOnPauseMs = 0L
+        }
+        val cfg = repository.loadModeConfigs()[current.activeMode]!!
+        _timerState.value = current.copy(isPaused = false)
+        updateMediaPlaybackState(isPlaying = true)
+        updateNotification()
+        audioEngine.speak("Retomando RCP.", flushQueue = true)
+        launchLoops(cfg)
+    }
+
+    fun registerEvent(type: RcpEventType, customTitle: String? = null) {
+        val current = _timerState.value
+        val cfg = repository.loadModeConfigs()[current.activeMode]!!
+        val record = RcpEventRecord(
+            type = type,
+            customTitle = customTitle,
+            elapsedSeconds = current.totalElapsedSeconds,
+            cycleNumber = current.cycleNumber,
+            timestampIso = Instant.now().toString()
+        )
+
+        val nextShocks = if (type == RcpEventType.CHOQUE) current.shocksCount + 1 else current.shocksCount
+        val nextAmio = if (type == RcpEventType.AMIODARONA) current.amiodaronaCount + 1 else current.amiodaronaCount
+        val nextAdreDue = if (type == RcpEventType.ADRENALINA) false else current.adrenalinaDue
+        val nextIntubated = if (type == RcpEventType.INTUBACAO) true else current.isIntubated
+
+        if (type == RcpEventType.INTUBACAO) {
+            ventilationWaitUntilMs = 0L
+            remainingVentPauseOnPauseMs = 0L
+            isVentilationPhase = false
+            beatStepInPattern = 0
+        }
+
+        _timerState.value = current.copy(
+            shocksCount = nextShocks,
+            amiodaronaCount = nextAmio,
+            adrenalinaDue = nextAdreDue,
+            isIntubated = nextIntubated,
+            currentPhaseLabel = if (type == RcpEventType.INTUBACAO) "Compressões contínuas (Intubado)" else current.currentPhaseLabel,
+            events = listOf(record) + current.events
+        )
+
+        val spoken = if (type == RcpEventType.PERSONALIZADO && !customTitle.isNullOrBlank()) {
+            "$customTitle registrado."
+        } else {
+            type.spokenConfirmation
+        }
+        lastCriticalSpeechAt = current.totalElapsedSeconds
+        speakProtected(spoken, flushQueue = false)
+
+        if (type == RcpEventType.CHOQUE && cfg.amiodaronaProtocol.enabled) {
+            if (nextShocks >= cfg.amiodaronaProtocol.firstDoseAfterShock && nextAmio == 0 && !amiodaronaDose1Prompted) {
+                amiodaronaDose1Prompted = true
+                lastCriticalSpeechAt = current.totalElapsedSeconds
+                speakProtected(cfg.amiodaronaProtocol.firstDoseMessage, flushQueue = false)
+            } else if (nextShocks >= cfg.amiodaronaProtocol.secondDoseAfterShock && nextAmio == 1 && !amiodaronaDose2Prompted) {
+                amiodaronaDose2Prompted = true
+                lastCriticalSpeechAt = current.totalElapsedSeconds
+                speakProtected(cfg.amiodaronaProtocol.secondDoseMessage, flushQueue = false)
+            }
+        }
+
+        when (type) {
+            RcpEventType.ADRENALINA -> lastReminderElapsed[ReminderKey.ADRENALINA] = current.totalElapsedSeconds
+            RcpEventType.AMIODARONA -> lastReminderElapsed[ReminderKey.AMIODARONA] = current.totalElapsedSeconds
+            RcpEventType.OUTRO_ANTIARRITMICO -> lastReminderElapsed[ReminderKey.ANTIARRITMICO] = current.totalElapsedSeconds
+            RcpEventType.CHOQUE -> lastReminderElapsed[ReminderKey.CHOQUE] = current.totalElapsedSeconds
+            RcpEventType.VERIFICAR_RITMO -> lastReminderElapsed[ReminderKey.VERIFICAR_RITMO] = current.totalElapsedSeconds
+            RcpEventType.TROCAR_COMPRESSOR -> lastReminderElapsed[ReminderKey.TROCAR_COMPRESSOR] = current.totalElapsedSeconds
+            else -> Unit
+        }
+    }
+
+    fun stopAndSaveSession(): RcpSessionRecord? {
+        ventilationWaitUntilMs = 0L
+        remainingVentPauseOnPauseMs = 0L
+        pausedMp3PosMs = null
+        beatStepInPattern = 0
+        timerJob?.cancel()
+        metronomeJob?.cancel()
+        mp3SyncJob?.cancel()
+        audioEngine.stopMp3Loop()
+        val current = _timerState.value
+        var saved: RcpSessionRecord? = null
+
+        if (current.isRunning && current.totalElapsedSeconds > 0) {
+            val shocks = current.events.count { it.type == RcpEventType.CHOQUE }
+            val meds = current.events.count {
+                it.type == RcpEventType.ADRENALINA ||
+                    it.type == RcpEventType.AMIODARONA ||
+                    it.type == RcpEventType.OUTRO_ANTIARRITMICO
+            }
+            val switches = current.events.count { it.type == RcpEventType.TROCAR_COMPRESSOR }
+
+            saved = RcpSessionRecord(
+                startedAtIso = sessionStartedAtIso.ifBlank { Instant.now().toString() },
+                mode = current.activeMode,
+                totalDurationSeconds = current.totalElapsedSeconds,
+                completedCycles = (current.cycleNumber - 1).coerceAtLeast(0),
+                shocksCount = shocks,
+                medicationsCount = meds,
+                compressorSwitchesCount = switches,
+                events = current.events.reversed()
+            )
+            repository.appendSession(saved)
+        }
+
+        val cfg = repository.loadModeConfigs()[current.activeMode]!!
+        _timerState.value = RcpTimerState(
+            isRunning = false,
+            isPaused = false,
+            activeMode = current.activeMode,
+            cycleNumber = 1,
+            cycleRemainingSeconds = cfg.cycleDurationSeconds,
+            totalElapsedSeconds = 0,
+            currentPhaseLabel = "Pronto",
+            adrenalinaRemainingSeconds = cfg.reminders[ReminderKey.ADRENALINA]?.intervalSeconds,
+            isIntubated = false,
+            events = emptyList()
+        )
+
+        releaseWakeLock()
+        updateMediaPlaybackState(isPlaying = false)
+        if (isForegroundActive) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            isForegroundActive = false
+        }
+        return saved
+    }
+
+    private fun launchLoops(cfg: ModeConfig) {
+        timerJob?.cancel()
+        metronomeJob?.cancel()
+        mp3SyncJob?.cancel()
+
+        timerJob = serviceScope.launch {
+            var nextTickAt = SystemClock.elapsedRealtime() + 1000L
+            while (isActive) {
+                val waitMs = (nextTickAt - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+                delay(waitMs)
+                nextTickAt += 1000L
+                onSecondTick(cfg)
+            }
+        }
+
+        val settings = repository.loadAudioSettings()
+        liveBeatOffsetMs = settings.mp3BeatOffsetMs
+        val effectiveBpm = audioEngine.getEffectiveBeatBpm(cfg.metronomeBpm).coerceIn(60.0, 165.0)
+        val beatPeriodRealMs = 60_000.0 / effectiveBpm
+        val beatOriginMs = SystemClock.elapsedRealtime() + 35L
+
+        metronomeJob = serviceScope.launch {
+            var beatIdx = 0L
+            while (isActive) {
+                val targetAt = beatOriginMs + kotlin.math.round(beatIdx * beatPeriodRealMs).toLong()
+                val waitMs = (targetAt - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+                if (waitMs > 0L) delay(waitMs)
+                onMetronomeBeat(cfg)
+                beatIdx += 1L
+            }
+        }
+
+        if (audioEngine.wantsMp3Playback()) {
+            mp3SyncJob = serviceScope.launch {
+                val exactMp3Bpm = if (settings.mp3SyncSpeed) {
+                    audioEngine.getSyncedEffectiveMp3Bpm(cfg.metronomeBpm)
+                } else {
+                    audioEngine.getExactMp3Bpm()
+                }
+                val periodOrigMs = 60_000.0 / exactMp3Bpm
+                val initialOffsetOrigMs = (((liveBeatOffsetMs.toDouble() % periodOrigMs) + periodOrigMs) % periodOrigMs)
+                val trimStartMs = settings.mp3TrimStartMs.coerceAtLeast(0)
+                val kFirstLoop = kotlin.math.max(
+                    0,
+                    kotlin.math.ceil((trimStartMs - initialOffsetOrigMs) / periodOrigMs - 1e-6).toInt()
+                )
+                val loopStartMs = kotlin.math.round(initialOffsetOrigMs + kFirstLoop * periodOrigMs).toInt()
+                val loopEndMs = if (settings.mp3LoopEndMs > loopStartMs + (periodOrigMs * 4).toInt()) {
+                    val nBeats = kotlin.math.max(
+                        4,
+                        kotlin.math.round((settings.mp3LoopEndMs - loopStartMs) / periodOrigMs).toInt()
+                    )
+                    kotlin.math.round(loopStartMs + nBeats * periodOrigMs).toInt()
+                } else 0
+
+                val startPosMs = pausedMp3PosMs ?: trimStartMs
+                pausedMp3PosMs = null
+                audioEngine.prepareMp3ForSyncedStart(cfg.metronomeBpm, startPosMs)
+
+                val baseSpeed = audioEngine.getBasePlaybackSpeed(cfg.metronomeBpm).toDouble().coerceIn(0.85, 1.18)
+                val distToNextBeatOrigMs = if (startPosMs <= loopStartMs) {
+                    (loopStartMs - startPosMs).toDouble()
+                } else {
+                    val beatsPassed = (startPosMs - initialOffsetOrigMs) / periodOrigMs
+                    (kotlin.math.ceil(beatsPassed - 1e-6) - beatsPassed) * periodOrigMs
+                }
+                val distRealMs = distToNextBeatOrigMs / baseSpeed
+                val minTargetMs = SystemClock.elapsedRealtime() + 10.0 + distRealMs
+                val kTargetBeat = kotlin.math.max(
+                    1L,
+                    kotlin.math.ceil((minTargetMs - beatOriginMs) / beatPeriodRealMs - 1e-6).toLong()
+                )
+                val targetBeatAt = beatOriginMs + kTargetBeat * beatPeriodRealMs
+                val mp3StartAt = (targetBeatAt - distRealMs).toLong()
+                val initialDelay = (mp3StartAt - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+                if (initialDelay > 0L) delay(initialDelay)
+
+                audioEngine.startMp3Now(cfg.metronomeBpm)
+                val actualStartedElapsed = SystemClock.elapsedRealtime()
+                var initialWarmupSeekDone = false
+                var lastSeekAtMs = 0L
+                var lastAppliedOffsetMs = liveBeatOffsetMs
+
+                while (isActive) {
+                    delay(45L)
+                    if (!audioEngine.isMp3PlayingNow()) continue
+                    val posMs = audioEngine.getMp3PositionMs()
+                    if (loopEndMs > loopStartMs + 2000 && posMs >= loopEndMs) {
+                        audioEngine.seekMp3To(loopStartMs)
+                        continue
+                    }
+
+                    val nowMs = SystemClock.elapsedRealtime()
+                    val currentOffsetMs = liveBeatOffsetMs
+                    val offsetChangedByUser = currentOffsetMs != lastAppliedOffsetMs
+                    val offsetOrigMs = (((currentOffsetMs.toDouble() % periodOrigMs) + periodOrigMs) % periodOrigMs)
+                    val beatPhaseFrac = (nowMs - beatOriginMs) / beatPeriodRealMs
+                    val targetFracInBeat = beatPhaseFrac - kotlin.math.floor(beatPhaseFrac)
+                    val actualBeatsFromOffset = (posMs - offsetOrigMs) / periodOrigMs
+                    val actualFracInBeat = actualBeatsFromOffset - kotlin.math.floor(actualBeatsFromOffset)
+
+                    var fracError = targetFracInBeat - actualFracInBeat
+                    if (fracError > 0.5) fracError -= 1.0
+                    if (fracError < -0.5) fracError += 1.0
+                    val errMs = fracError * periodOrigMs
+
+                    if (offsetChangedByUser ||
+                        (!initialWarmupSeekDone && nowMs - actualStartedElapsed in 250L..1600L && kotlin.math.abs(errMs) > 30.0) ||
+                        (kotlin.math.abs(errMs) > 90.0 && nowMs - lastSeekAtMs > 300L)
+                    ) {
+                        lastAppliedOffsetMs = currentOffsetMs
+                        initialWarmupSeekDone = true
+                        lastSeekAtMs = nowMs
+                        audioEngine.seekMp3To(kotlin.math.round(posMs + errMs).toInt().coerceAtLeast(0))
+                        audioEngine.setPllSpeedTrim(1.0f)
+                    } else if (errMs < -2.0) {
+                        // MP3 adiantado: micro-redução suave (máx -3.5%)
+                        val trim = (1.0 + errMs / 1800.0).coerceAtLeast(0.965)
+                        audioEngine.setPllSpeedTrim(trim.toFloat())
+                    } else if (errMs > 2.0) {
+                        // MP3 atrasado: micro-aumento suave para alcançar a batida (máx +5.5%)
+                        val trim = (1.0 + errMs / 900.0).coerceAtMost(1.055)
+                        audioEngine.setPllSpeedTrim(trim.toFloat())
+                    } else {
+                        audioEngine.setPllSpeedTrim(1.0f)
+                    }
+                }
+            }
+        } else {
+            audioEngine.pauseMp3Loop()
+        }
+    }
+
+    private fun onSecondTick(cfg: ModeConfig) {
+        val current = _timerState.value
+        val newElapsed = current.totalElapsedSeconds + 1
+        var newRemaining = current.cycleRemainingSeconds - 1
+        var newCycle = current.cycleNumber
+        var spokeCriticalThisSecond = false
+        var adreDue = current.adrenalinaDue
+        var activeFiveTip = current.currentFiveHsTsTip
+
+        val compRemCfg = cfg.reminders[ReminderKey.TROCAR_COMPRESSOR]
+        val compAnchor = lastReminderElapsed[ReminderKey.TROCAR_COMPRESSOR] ?: 0
+        val compRemaining = if (compRemCfg != null && compRemCfg.enabled && compRemCfg.intervalSeconds > 20) {
+            compRemCfg.intervalSeconds - (newElapsed - compAnchor)
+        } else null
+        val shouldPreWarnCompressor = cfg.voiceMessages.compressorPreWarningEnabled && (
+            (compRemaining == 15 && lastCompressorPreWarnAnchor != compAnchor) ||
+                ((compRemCfg == null || !compRemCfg.enabled) && newRemaining == 15 && cfg.cycleDurationSeconds >= 40)
+            )
+
+        var cycleJustEnded = false
+        if (newRemaining <= 0) {
+            cycleJustEnded = true
+            audioEngine.playCycleAlarm()
+            // Usa flushQueue = false para não interromper avisos de tempo ou 5Hs/5Ts em andamento
+            speakProtected(cfg.voiceMessages.cycleCompletedCue, flushQueue = false)
+            newCycle += 1
+            newRemaining = cfg.cycleDurationSeconds
+            thirtySecondAnnouncedCycle = -1
+            lastAnnouncementCycleRemaining = -1
+            beatStepInPattern = 0
+            ventilationWaitUntilMs = 0L
+            remainingVentPauseOnPauseMs = 0L
+            isVentilationPhase = false
+            spokeCriticalThisSecond = true
+            lastCriticalSpeechAt = newElapsed
+        } else {
+            if (newRemaining == 30 && thirtySecondAnnouncedCycle != newCycle) {
+                thirtySecondAnnouncedCycle = newCycle
+                speakProtected(cfg.voiceMessages.thirtySecondsCue, flushQueue = false)
+                spokeCriticalThisSecond = true
+                lastCriticalSpeechAt = newElapsed
+            } else if (shouldPreWarnCompressor) {
+                lastCompressorPreWarnAnchor = compAnchor
+                speakProtected(cfg.voiceMessages.compressorPreWarningCue, flushQueue = false)
+                spokeCriticalThisSecond = true
+                lastCriticalSpeechAt = newElapsed
+            } else if (
+                cfg.announceTimeEvery10s &&
+                newRemaining % 10 == 0 &&
+                newRemaining < cfg.cycleDurationSeconds &&
+                lastAnnouncementCycleRemaining != newRemaining
+            ) {
+                lastAnnouncementCycleRemaining = newRemaining
+                speakProtected(formatSpokenPtBrTime(newRemaining), flushQueue = false)
+                spokeCriticalThisSecond = true
+                lastCriticalSpeechAt = newElapsed
+            }
+        }
+
+        val adreRemCfg = cfg.reminders[ReminderKey.ADRENALINA]
+        val adreAnchor = lastReminderElapsed[ReminderKey.ADRENALINA] ?: 0
+        val adrePreRemaining = if (adreRemCfg != null && adreRemCfg.enabled && adreRemCfg.intervalSeconds > 35) {
+            adreRemCfg.intervalSeconds - (newElapsed - adreAnchor)
+        } else null
+        if (cfg.voiceMessages.adrenalinaPreWarningEnabled && adrePreRemaining == 30 && lastAdrenalinaPreWarnAnchor != adreAnchor) {
+            lastAdrenalinaPreWarnAnchor = adreAnchor
+            speakProtected(cfg.voiceMessages.adrenalinaPreWarningCue, flushQueue = false)
+            spokeCriticalThisSecond = true
+            lastCriticalSpeechAt = newElapsed
+        }
+
+        cfg.reminders.forEach { (key, reminder) ->
+            if (!reminder.enabled || reminder.intervalSeconds <= 0) return@forEach
+            val lastAt = lastReminderElapsed[key] ?: 0
+            if (newElapsed - lastAt >= reminder.intervalSeconds) {
+                lastReminderElapsed[key] = newElapsed
+                if (cycleJustEnded && (key == ReminderKey.VERIFICAR_RITMO || key == ReminderKey.TROCAR_COMPRESSOR)) {
+                    return@forEach
+                }
+                speakProtected(reminder.message, flushQueue = false)
+                spokeCriticalThisSecond = true
+                lastCriticalSpeechAt = newElapsed
+                if (key == ReminderKey.ADRENALINA) {
+                    adreDue = true
+                }
+            }
+        }
+
+        val nowMs = SystemClock.elapsedRealtime()
+        val isAudioBusyNow = audioEngine.isSpeaking() || nowMs < protectedSpeechUntilMs
+
+        if (
+            cfg.pattern.isContinuous &&
+            !current.isIntubated &&
+            !spokeCriticalThisSecond &&
+            !isAudioBusyNow &&
+            newElapsed % cfg.continuousVentilationIntervalSeconds == 0
+        ) {
+            speakProtected(cfg.voiceMessages.ventilationsCue, flushQueue = false)
+            spokeCriticalThisSecond = true
+            lastCriticalSpeechAt = newElapsed
+        }
+
+        // Janela segura para 5Hs e 5Ts: nunca interrompe e nunca colide com avisos de tempo ou eventos
+        if (cfg.fiveHsTs.enabled) {
+            val cycleElapsed = cfg.cycleDurationSeconds - newRemaining
+            val nextTenSecIn = if (cfg.announceTimeEvery10s) {
+                if (newRemaining % 10 == 0) 0 else newRemaining % 10
+            } else 999
+            val nextThirtySecIn = if (newRemaining > 30) newRemaining - 30 else 999
+            val nextCompPreWarnIn = if (cfg.voiceMessages.compressorPreWarningEnabled) {
+                minOf(
+                    if (compRemaining != null && compRemaining > 15) compRemaining - 15 else 999,
+                    if ((compRemCfg == null || !compRemCfg.enabled) && newRemaining > 15) newRemaining - 15 else 999
+                )
+            } else 999
+            val nextAdrePreWarnIn = if (cfg.voiceMessages.adrenalinaPreWarningEnabled && adrePreRemaining != null && adrePreRemaining > 30) {
+                adrePreRemaining - 30
+            } else 999
+            var nextReminderIn = 999
+            cfg.reminders.forEach { (key, r) ->
+                if (r.enabled && r.intervalSeconds > 0) {
+                    val dueIn = (r.intervalSeconds - (newElapsed - (lastReminderElapsed[key] ?: 0))).coerceAtLeast(0)
+                    nextReminderIn = minOf(nextReminderIn, dueIn)
+                }
+            }
+            val nextScheduledAlertIn = minOf(
+                nextTenSecIn,
+                nextThirtySecIn,
+                newRemaining,
+                nextCompPreWarnIn,
+                nextAdrePreWarnIn,
+                nextReminderIn
+            )
+
+            fun canSpeakFiveHs(textToSpeak: String): Boolean {
+                if (spokeCriticalThisSecond || isVentilationPhase || isAudioBusyNow) return false
+                if (cycleElapsed < 10 || newRemaining <= 35) return false
+                if (newElapsed - lastCriticalSpeechAt < 2) return false
+                val neededClearSeconds = ((estimateSpeechMs(textToSpeak) + 999L) / 1000L).toInt() + 2
+                return nextScheduledAlertIn >= neededClearSeconds
+            }
+
+            if (!fiveHsInitialDone && newElapsed >= cfg.fiveHsTs.initialPromptDelaySeconds) {
+                if (canSpeakFiveHs(cfg.fiveHsTs.initialPromptMessage)) {
+                    fiveHsInitialDone = true
+                    lastFiveHsTipAt = newElapsed
+                    speakProtected(cfg.fiveHsTs.initialPromptMessage, flushQueue = false)
+                }
+            } else if (fiveHsInitialDone) {
+                if (newElapsed - lastFiveHsTipAt >= cfg.fiveHsTs.tipIntervalSeconds) {
+                    pendingFiveHsTip = true
+                }
+                if (pendingFiveHsTip) {
+                    val tips = RcpDefaults.FIVE_HS_AND_FIVE_TS
+                    val tip = tips[fiveHsTipIndex % tips.size]
+                    if (canSpeakFiveHs(tip.spokenTip)) {
+                        fiveHsTipIndex = (fiveHsTipIndex + 1) % tips.size
+                        lastFiveHsTipAt = newElapsed
+                        pendingFiveHsTip = false
+                        activeFiveTip = tip
+                        speakProtected(tip.spokenTip, flushQueue = false)
+                    }
+                }
+            }
+        }
+
+        val adreCfg = cfg.reminders[ReminderKey.ADRENALINA]
+        val adreRem = if (adreCfg != null && adreCfg.enabled) {
+            (adreCfg.intervalSeconds - (newElapsed - (lastReminderElapsed[ReminderKey.ADRENALINA] ?: 0)))
+                .coerceAtLeast(0)
+        } else null
+
+        _timerState.value = current.copy(
+            cycleNumber = newCycle,
+            cycleRemainingSeconds = newRemaining,
+            totalElapsedSeconds = newElapsed,
+            adrenalinaRemainingSeconds = adreRem,
+            adrenalinaDue = adreDue,
+            currentFiveHsTsTip = activeFiveTip
+        )
+        updateNotification()
+    }
+
+    private fun onMetronomeBeat(cfg: ModeConfig) {
+        val current = _timerState.value
+        if (cfg.pattern.isContinuous || current.isIntubated) {
+            ventilationWaitUntilMs = 0L
+            remainingVentPauseOnPauseMs = 0L
+            isVentilationPhase = false
+            audioEngine.playMetronomeBeat(isVentilationPhase = false)
+            _timerState.value = current.copy(
+                beatTick = current.beatTick + 1,
+                currentPhaseLabel = if (current.isIntubated) "Compressões contínuas (Intubado)" else "Compressões contínuas"
+            )
+            return
+        }
+
+        val now = SystemClock.elapsedRealtime()
+        if (ventilationWaitUntilMs > 0L) {
+            if (now < ventilationWaitUntilMs) {
+                val secsLeft = ((ventilationWaitUntilMs - now + 999L) / 1000L).toInt().coerceAtLeast(1)
+                isVentilationPhase = true
+                // O metrônomo nunca para durante a pausa de ventilação
+                audioEngine.playMetronomeBeat(isVentilationPhase = true)
+                _timerState.value = current.copy(
+                    beatTick = current.beatTick + 1,
+                    currentPhaseLabel = "Ventilações (${secsLeft}s)"
+                )
+                return
+            }
+            ventilationWaitUntilMs = 0L
+            isVentilationPhase = false
+            beatStepInPattern = 0
+            lastCriticalSpeechAt = current.totalElapsedSeconds
+            audioEngine.speak(cfg.voiceMessages.compressionsCue, flushQueue = false)
+        }
+
+        val compCount = cfg.pattern.compressionsCount
+        if (beatStepInPattern >= compCount) {
+            ventilationWaitUntilMs = now + 10_000L
+            isVentilationPhase = true
+            beatStepInPattern = 0
+            lastCriticalSpeechAt = current.totalElapsedSeconds
+            audioEngine.playMetronomeBeat(isVentilationPhase = true)
+            audioEngine.speak(cfg.voiceMessages.ventilationsCue, flushQueue = false)
+            _timerState.value = current.copy(
+                beatTick = current.beatTick + 1,
+                currentPhaseLabel = "Ventilações (10s)"
+            )
+            return
+        }
+
+        val compIdx = beatStepInPattern
+        isVentilationPhase = false
+        audioEngine.playMetronomeBeat(isVentilationPhase = false)
+        beatStepInPattern = compIdx + 1
+
+        _timerState.value = current.copy(
+            beatTick = current.beatTick + 1,
+            currentPhaseLabel = "Compressões (${compIdx + 1}/$compCount)"
+        )
+    }
+
+    private fun promoteToForeground() {
+        val notification = buildNotification()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+            )
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
+        isForegroundActive = true
+    }
+
+    private fun updateNotification() {
+        if (!isForegroundActive) return
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        nm.notify(NOTIFICATION_ID, buildNotification())
+    }
+
+    private fun buildNotification(): Notification {
+        val state = _timerState.value
+        val openAppIntent = PendingIntent.getActivity(
+            this,
+            0,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        val toggleActionIntent = PendingIntent.getService(
+            this,
+            1,
+            Intent(this, RcpForegroundService::class.java).apply {
+                action = if (state.isPaused) ACTION_RESUME else ACTION_PAUSE
+            },
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        val stopActionIntent = PendingIntent.getService(
+            this,
+            2,
+            Intent(this, RcpForegroundService::class.java).apply { action = ACTION_STOP },
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        val statusText = if (state.isPaused) "Pausado" else state.currentPhaseLabel
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_media_play)
+            .setContentTitle("${state.activeMode.label} · Ciclo ${state.cycleNumber}")
+            .setContentText("Restante ${formatMmSs(state.cycleRemainingSeconds)} · Total ${formatMmSs(state.totalElapsedSeconds)} · $statusText")
+            .setContentIntent(openAppIntent)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .addAction(
+                if (state.isPaused) android.R.drawable.ic_media_play else android.R.drawable.ic_media_pause,
+                if (state.isPaused) "Retomar" else "Pausar",
+                toggleActionIntent
+            )
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Encerrar", stopActionIntent)
+            .setStyle(
+                MediaStyle()
+                    .setMediaSession(mediaSession.sessionToken)
+                    .setShowActionsInCompactView(0, 1)
+            )
+            .build()
+    }
+
+    private fun updateMediaPlaybackState(isPlaying: Boolean) {
+        val state = if (isPlaying) PlaybackStateCompat.STATE_PLAYING else PlaybackStateCompat.STATE_PAUSED
+        mediaSession.setPlaybackState(
+            PlaybackStateCompat.Builder()
+                .setActions(
+                    PlaybackStateCompat.ACTION_PLAY or
+                        PlaybackStateCompat.ACTION_PAUSE or
+                        PlaybackStateCompat.ACTION_STOP
+                )
+                .setState(state, _timerState.value.totalElapsedSeconds * 1000L, 1.0f)
+                .build()
+        )
+    }
+
+    private fun acquireWakeLock() {
+        if (wakeLock?.isHeld == true) return
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "CronometroRcp::TimerWakeLock").apply {
+            acquire(6 * 60 * 60 * 1000L)
+        }
+    }
+
+    private fun releaseWakeLock() {
+        if (wakeLock?.isHeld == true) {
+            wakeLock?.release()
+        }
+        wakeLock = null
+    }
+
+    private fun createNotificationChannel() {
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val channel = NotificationChannel(
+            CHANNEL_ID,
+            "Cronômetro RCP em Execução",
+            NotificationManager.IMPORTANCE_LOW
+        ).apply {
+            description = "Mantém cronômetro, metrônomo e alertas de voz ativos com a tela apagada."
+        }
+        manager.createNotificationChannel(channel)
+    }
+
+    override fun onDestroy() {
+        timerJob?.cancel()
+        metronomeJob?.cancel()
+        releaseWakeLock()
+        mediaSession.release()
+        audioEngine.release()
+        serviceScope.cancel()
+        super.onDestroy()
+    }
+
+    companion object {
+        const val CHANNEL_ID = "rcp_media_playback_channel"
+        const val NOTIFICATION_ID = 1001
+        const val ACTION_PAUSE = "br.com.cronometrorcp.ACTION_PAUSE"
+        const val ACTION_RESUME = "br.com.cronometrorcp.ACTION_RESUME"
+        const val ACTION_STOP = "br.com.cronometrorcp.ACTION_STOP"
+    }
+}
+
+
+================================================================================
+FILE: app/src/main/java/br/com/cronometrorcp/audio/RcpAudioEngine.kt
+================================================================================
+
+package br.com.cronometrorcp.audio
+
+import android.content.Context
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioFormat
+import android.media.AudioManager
+import android.media.AudioTrack
+import android.media.MediaPlayer
+import android.net.Uri
+import android.os.Bundle
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
+import br.com.cronometrorcp.model.AudioSettings
+import br.com.cronometrorcp.model.RhythmAudioSource
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import java.util.Locale
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.PI
+import kotlin.math.exp
+import kotlin.math.sin
+import kotlin.math.tanh
+
+class RcpAudioEngine(context: Context) : TextToSpeech.OnInitListener {
+
+    private val appContext = context.applicationContext
+    private val audioManager = appContext.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    private var tts: TextToSpeech? = TextToSpeech(appContext, this)
+    @Volatile
+    private var isTtsReady = false
+    @Volatile
+    private var audioSettings = AudioSettings()
+    @Volatile
+    private var currentTargetBpm = 110
+    @Volatile
+    private var pllSpeedTrim = 1.0f
+    @Volatile
+    private var hasAudioFocus = false
+
+    private var mp3Player: MediaPlayer? = null
+    private var loadedMp3Uri: String? = null
+    private val activeUtteranceIds = ConcurrentHashMap.newKeySet<String>()
+
+    private val speechAudioAttributes = AudioAttributes.Builder()
+        .setUsage(AudioAttributes.USAGE_MEDIA)
+        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+        .build()
+
+    private val alarmAudioAttributes = AudioAttributes.Builder()
+        .setUsage(AudioAttributes.USAGE_MEDIA)
+        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+        .build()
+
+    private val musicAudioAttributes = AudioAttributes.Builder()
+        .setUsage(AudioAttributes.USAGE_MEDIA)
+        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+        .build()
+
+    // Solicita foco como conteúdo de fala usando AUDIOFOCUS_GAIN sem MAY_DUCK,
+    // evitando que o sistema Android baixe o volume do MP3, metrônomo ou alarmes.
+    private val focusRequest: AudioFocusRequest = AudioFocusRequest.Builder(
+        AudioManager.AUDIOFOCUS_GAIN
+    )
+        .setAudioAttributes(speechAudioAttributes)
+        .setWillPauseWhenDucked(false)
+        .setAcceptsDelayedFocusGain(false)
+        .setOnAudioFocusChangeListener { }
+        .build()
+
+    private val compressionClickPcm = synthesizeClick(freqHz = 1320.0, durationMs = 55, gain = 1.0f)
+    private val ventilationCuePcm = synthesizeClick(freqHz = 820.0, durationMs = 75, gain = 0.95f)
+    private val cycleAlarmPcm = synthesizeCycleAlarm()
+
+    private fun ensureAudioFocus() {
+        if (!hasAudioFocus) {
+            val res = audioManager.requestAudioFocus(focusRequest)
+            hasAudioFocus = res == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        }
+    }
+
+    fun updateAudioSettings(settings: AudioSettings) {
+        audioSettings = settings
+        if (settings.isMuted) {
+            tts?.stop()
+        }
+        if (settings.mp3UriString != loadedMp3Uri) {
+            prepareMp3Player(settings.mp3UriString)
+        }
+        syncMp3PlayerParams()
+    }
+
+    fun setTargetBpm(bpm: Int) {
+        currentTargetBpm = bpm
+        syncMp3PlayerParams()
+    }
+
+    private fun prepareMp3Player(uriString: String?) {
+        stopMp3Loop()
+        mp3Player?.release()
+        mp3Player = null
+        loadedMp3Uri = uriString
+
+        if (uriString.isNullOrBlank()) return
+        try {
+            val player = MediaPlayer().apply {
+                setAudioAttributes(musicAudioAttributes)
+                setDataSource(appContext, Uri.parse(uriString))
+                isLooping = true
+                prepare()
+            }
+            mp3Player = player
+            syncMp3PlayerParams()
+        } catch (_: Exception) {
+            mp3Player = null
+        }
+    }
+
+    private fun syncMp3PlayerParams(applyPlaybackParams: Boolean = false) {
+        val player = mp3Player ?: return
+        val settings = audioSettings
+        // Volume exclusivo do MP3: nunca é reduzido por voz, alarme ou metrônomo
+        val mp3Vol = if (settings.isMuted) 0f else settings.mp3Volume.coerceIn(0f, 1f)
+        try {
+            player.setVolume(mp3Vol, mp3Vol)
+            if (applyPlaybackParams || player.isPlaying) {
+                val baseSpeed = getBasePlaybackSpeed(currentTargetBpm)
+                val combinedSpeed = (baseSpeed * pllSpeedTrim).coerceIn(0.82f, 1.24f)
+                player.playbackParams = player.playbackParams.setSpeed(combinedSpeed)
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    fun getExactMp3Bpm(): Double {
+        val exact = if (audioSettings.mp3ExactBpm > 1f) {
+            audioSettings.mp3ExactBpm.toDouble()
+        } else {
+            audioSettings.mp3OriginalBpm.toDouble()
+        }
+        return exact.coerceIn(85.0, 145.0)
+    }
+
+    fun getSyncedEffectiveMp3Bpm(modeBpm: Int): Double = getExactMp3Bpm()
+
+    fun getEffectiveBeatBpm(modeBpm: Int): Double {
+        if (wantsMp3Playback()) {
+            if (audioSettings.mp3SyncSpeed) return modeBpm.toDouble()
+            if (audioSettings.followMusicRhythm) return getExactMp3Bpm().coerceIn(85.0, 145.0)
+        }
+        return modeBpm.toDouble()
+    }
+
+    fun getBasePlaybackSpeed(modeBpm: Int): Float {
+        if (!wantsMp3Playback() || !audioSettings.mp3SyncSpeed) return 1.0f
+        val effectiveMp3 = getSyncedEffectiveMp3Bpm(modeBpm)
+        return (modeBpm.toDouble() / effectiveMp3).toFloat().coerceIn(0.85f, 1.18f)
+    }
+
+    fun setPllSpeedTrim(trim: Float) {
+        val clamped = trim.coerceIn(0.965f, 1.055f)
+        if (kotlin.math.abs(clamped - pllSpeedTrim) < 0.0005f) return
+        pllSpeedTrim = clamped
+        syncMp3PlayerParams()
+    }
+
+    fun wantsMp3Playback(): Boolean {
+        val s = audioSettings
+        val wants = s.rhythmSource == RhythmAudioSource.MP3_ONLY ||
+            s.rhythmSource == RhythmAudioSource.MP3_AND_METRONOME
+        return wants && !s.mp3UriString.isNullOrBlank()
+    }
+
+    fun prepareMp3ForSyncedStart(targetBpm: Int, seekMs: Int) {
+        currentTargetBpm = targetBpm
+        pllSpeedTrim = 1.0f
+        if (!wantsMp3Playback()) {
+            pauseMp3Loop()
+            return
+        }
+        ensureAudioFocus()
+        if (mp3Player == null || loadedMp3Uri != audioSettings.mp3UriString) {
+            prepareMp3Player(audioSettings.mp3UriString)
+        }
+        try {
+            if (mp3Player?.isPlaying == true) {
+                mp3Player?.pause()
+            }
+            val dur = mp3Player?.duration ?: 0
+            val safeSeek = if (dur > 500) seekMs.coerceIn(0, dur - 250) else 0
+            mp3Player?.seekTo(safeSeek)
+        } catch (_: Exception) {
+        }
+        syncMp3PlayerParams()
+    }
+
+    fun startMp3Now(targetBpm: Int) {
+        currentTargetBpm = targetBpm
+        if (!wantsMp3Playback()) return
+        ensureAudioFocus()
+        if (mp3Player == null || loadedMp3Uri != audioSettings.mp3UriString) {
+            prepareMp3Player(audioSettings.mp3UriString)
+        }
+        try {
+            if (mp3Player?.isPlaying == false) {
+                mp3Player?.start()
+            }
+            syncMp3PlayerParams(applyPlaybackParams = true)
+        } catch (_: Exception) {
+        }
+    }
+
+    fun seekMp3To(ms: Int) {
+        try {
+            val dur = mp3Player?.duration ?: 0
+            val safeSeek = if (dur > 500) ms.coerceIn(0, dur - 250) else 0
+            mp3Player?.seekTo(safeSeek)
+        } catch (_: Exception) {
+        }
+    }
+
+    fun startMp3Loop(targetBpm: Int) {
+        currentTargetBpm = targetBpm
+        if (!wantsMp3Playback()) {
+            pauseMp3Loop()
+            return
+        }
+        ensureAudioFocus()
+        if (mp3Player == null || loadedMp3Uri != audioSettings.mp3UriString) {
+            prepareMp3Player(audioSettings.mp3UriString)
+        }
+        try {
+            if (mp3Player?.isPlaying == false) {
+                mp3Player?.start()
+            }
+            syncMp3PlayerParams(applyPlaybackParams = true)
+        } catch (_: Exception) {
+        }
+    }
+
+    fun pauseMp3Loop() {
+        try {
+            if (mp3Player?.isPlaying == true) {
+                mp3Player?.pause()
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    fun stopMp3Loop() {
+        pllSpeedTrim = 1.0f
+        try {
+            if (mp3Player?.isPlaying == true) {
+                mp3Player?.pause()
+            }
+            mp3Player?.seekTo(0)
+        } catch (_: Exception) {
+        }
+    }
+
+    fun isMp3PlayingNow(): Boolean {
+        return try {
+            mp3Player?.isPlaying == true && !audioSettings.mp3UriString.isNullOrBlank()
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    fun getMp3PositionMs(): Int {
+        return try {
+            mp3Player?.currentPosition ?: 0
+        } catch (_: Exception) {
+            0
+        }
+    }
+
+    fun shouldFollowMusicRhythm(): Boolean {
+        val s = audioSettings
+        return wantsMp3Playback() && (s.mp3SyncSpeed || s.followMusicRhythm)
+    }
+
+    override fun onInit(status: Int) {
+        if (status != TextToSpeech.SUCCESS) {
+            isTtsReady = false
+            return
+        }
+        val engine = tts ?: return
+        engine.setAudioAttributes(speechAudioAttributes)
+
+        val ptBr = Locale("pt", "BR")
+        val res = engine.setLanguage(ptBr)
+        if (res == TextToSpeech.LANG_MISSING_DATA || res == TextToSpeech.LANG_NOT_SUPPORTED) {
+            val sysRes = engine.setLanguage(Locale.getDefault())
+            isTtsReady = sysRes != TextToSpeech.LANG_MISSING_DATA &&
+                sysRes != TextToSpeech.LANG_NOT_SUPPORTED
+        } else {
+            isTtsReady = true
+        }
+
+        engine.setSpeechRate(1.06f)
+        engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+            override fun onStart(utteranceId: String?) {}
+            override fun onDone(utteranceId: String?) {
+                if (utteranceId != null) activeUtteranceIds.remove(utteranceId)
+            }
+            @Deprecated("Deprecated in Java")
+            override fun onError(utteranceId: String?) {
+                if (utteranceId != null) activeUtteranceIds.remove(utteranceId)
+            }
+            override fun onError(utteranceId: String?, errorCode: Int) {
+                if (utteranceId != null) activeUtteranceIds.remove(utteranceId)
+            }
+        })
+    }
+
+    fun isSpeaking(): Boolean = activeUtteranceIds.isNotEmpty() || (tts?.isSpeaking == true)
+
+    fun speak(text: String, flushQueue: Boolean = false) {
+        val settings = audioSettings
+        if (settings.isMuted || settings.voiceVolume <= 0.01f || text.isBlank()) return
+
+        ensureAudioFocus()
+
+        if (!isTtsReady || tts == null) {
+            playPcm(ventilationCuePcm, settings.voiceVolume)
+            return
+        }
+
+        val params = Bundle().apply {
+            putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, settings.voiceVolume.coerceIn(0f, 1f))
+        }
+        val queueMode = if (flushQueue) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
+        val utteranceId = UUID.randomUUID().toString()
+        if (flushQueue) {
+            activeUtteranceIds.clear()
+        }
+        activeUtteranceIds.add(utteranceId)
+        val result = tts?.speak(text, queueMode, params, utteranceId)
+        if (result == TextToSpeech.ERROR) {
+            activeUtteranceIds.remove(utteranceId)
+            playPcm(ventilationCuePcm, settings.voiceVolume)
+        }
+    }
+
+    fun playMetronomeBeat(isVentilationPhase: Boolean) {
+        val settings = audioSettings
+        if (settings.isMuted || settings.metronomeVolume <= 0.01f) return
+        val pcm = if (isVentilationPhase) ventilationCuePcm else compressionClickPcm
+        playPcm(pcm, settings.metronomeVolume.coerceIn(0f, 1.0f))
+    }
+
+    fun playCycleAlarm() {
+        val settings = audioSettings
+        if (settings.isMuted || settings.alarmVolume <= 0.01f) return
+        playPcm(cycleAlarmPcm, settings.alarmVolume)
+    }
+
+    private fun playPcm(samples: ShortArray, volume: Float) {
+        val clamped = volume.coerceIn(0f, 1f)
+        scope.launch {
+            val minBuf = AudioTrack.getMinBufferSize(
+                SAMPLE_RATE,
+                AudioFormat.CHANNEL_OUT_MONO,
+                AudioFormat.ENCODING_PCM_16BIT
+            )
+            val byteCount = samples.size * 2
+            val track = AudioTrack.Builder()
+                .setAudioAttributes(alarmAudioAttributes)
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(SAMPLE_RATE)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                        .build()
+                )
+                .setTransferMode(AudioTrack.MODE_STATIC)
+                .setBufferSizeInBytes(maxOf(byteCount, minBuf))
+                .build()
+
+            try {
+                track.setVolume(clamped)
+                track.write(samples, 0, samples.size)
+                track.play()
+                val durationMs = (samples.size * 1000L) / SAMPLE_RATE
+                kotlinx.coroutines.delay(durationMs + 40L)
+            } catch (_: Exception) {
+            } finally {
+                try {
+                    track.stop()
+                } catch (_: Exception) {
+                }
+                track.release()
+            }
+        }
+    }
+
+    private fun synthesizeClick(freqHz: Double, durationMs: Int, gain: Float): ShortArray {
+        val count = (SAMPLE_RATE * durationMs) / 1000
+        return ShortArray(count) { i ->
+            val t = i.toDouble() / SAMPLE_RATE
+            val env = exp(-t * 24.0)
+            val fundamental = sin(2.0 * PI * freqHz * t)
+            val harmonic = 0.45 * sin(2.0 * PI * (freqHz * 2.0) * t)
+            val raw = (fundamental + harmonic) * env * gain
+            val saturated = tanh(raw * 2.1)
+            (saturated * Short.MAX_VALUE).toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
+        }
+    }
+
+    private fun synthesizeCycleAlarm(): ShortArray {
+        val toneMs = 150
+        val gapMs = 80
+        val totalMs = toneMs * 3 + gapMs * 2
+        val count = (SAMPLE_RATE * totalMs) / 1000
+        val freqs = listOf(880.0, 1046.5, 1318.5)
+        return ShortArray(count) { i ->
+            val ms = (i * 1000.0) / SAMPLE_RATE
+            val block = (ms / (toneMs + gapMs)).toInt()
+            val posInBlock = ms % (toneMs + gapMs)
+            if (block < 3 && posInBlock <= toneMs) {
+                val t = posInBlock / 1000.0
+                val env = (1.0 - (posInBlock / toneMs) * 0.35)
+                val wave = sin(2.0 * PI * freqs[block] * t) * env * 0.9
+                (wave * Short.MAX_VALUE).toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
+            } else {
+                0
+            }
+        }
+    }
+
+    fun release() {
+        stopMp3Loop()
+        mp3Player?.release()
+        mp3Player = null
+        tts?.stop()
+        tts?.shutdown()
+        tts = null
+        if (hasAudioFocus) {
+            audioManager.abandonAudioFocusRequest(focusRequest)
+            hasAudioFocus = false
+        }
+    }
+
+    companion object {
+        private const val SAMPLE_RATE = 22050
+    }
+}
+
+
+================================================================================
+FILE: app/src/main/java/br/com/cronometrorcp/audio/Mp3BeatAnalyzer.kt
+================================================================================
+
+package br.com.cronometrorcp.audio
+
+import android.content.Context
+import android.media.MediaCodec
+import android.media.MediaExtractor
+import android.media.MediaFormat
+import android.net.Uri
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.nio.ByteOrder
+import kotlin.math.PI
+import kotlin.math.ceil
+import kotlin.math.floor
+import kotlin.math.roundToInt
+import kotlin.math.sqrt
+
+data class Mp3BeatAnalysis(
+    val detectedBpm: Int = 110,
+    val exactBpm: Float = 110f,
+    val beatOffsetMs: Int = 0,
+    val trimStartMs: Int = 0,
+    val loopEndMs: Int = 0
+)
+
+object Mp3BeatAnalyzer {
+
+    suspend fun analyzeUri(context: Context, uri: Uri): Mp3BeatAnalysis = withContext(Dispatchers.Default) {
+        val extractor = MediaExtractor()
+        var codec: MediaCodec? = null
+        try {
+            extractor.setDataSource(context, uri, null)
+            var audioTrackIndex = -1
+            var format: MediaFormat? = null
+            for (i in 0 until extractor.trackCount) {
+                val f = extractor.getTrackFormat(i)
+                val mime = f.getString(MediaFormat.KEY_MIME) ?: ""
+                if (mime.startsWith("audio/")) {
+                    audioTrackIndex = i
+                    format = f
+                    break
+                }
+            }
+            if (audioTrackIndex < 0 || format == null) return@withContext Mp3BeatAnalysis()
+
+            extractor.selectTrack(audioTrackIndex)
+            val mime = format.getString(MediaFormat.KEY_MIME) ?: return@withContext Mp3BeatAnalysis()
+            val sampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+            val channels = if (format.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
+                format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+            } else 1
+            val durationUs = if (format.containsKey(MediaFormat.KEY_DURATION)) {
+                format.getLong(MediaFormat.KEY_DURATION)
+            } else 0L
+            val totalDurationSec = (durationUs / 1_000_000.0).coerceAtLeast(0.0)
+
+            // Decodifica até 50 segundos em envelope grave (~155 Hz) e RMS em quadros de ~10 ms
+            val hopSamples = (sampleRate / 100).coerceAtLeast(256)
+            val maxFrames = 5000
+            val bassList = ArrayList<Float>(maxFrames)
+            val rmsList = ArrayList<Float>(maxFrames)
+
+            codec = MediaCodec.createDecoderByType(mime).apply {
+                configure(format, null, null, 0)
+                start()
+            }
+
+            var lp = 0.0
+            val omega = 2.0 * PI * 155.0
+            val lpAlpha = minOf(0.18, omega / (sampleRate + omega))
+            var bassAcc = 0.0
+            var rmsAcc = 0.0
+            var accCount = 0
+
+            val bufferInfo = MediaCodec.BufferInfo()
+            var inputDone = false
+            var outputDone = false
+
+            while (!outputDone && bassList.size < maxFrames) {
+                if (!inputDone) {
+                    val inIdx = codec.dequeueInputBuffer(5000)
+                    if (inIdx >= 0) {
+                        val inBuf = codec.getInputBuffer(inIdx)!!
+                        val sampleSize = extractor.readSampleData(inBuf, 0)
+                        if (sampleSize < 0) {
+                            codec.queueInputBuffer(inIdx, 0, 0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                            inputDone = true
+                        } else {
+                            codec.queueInputBuffer(inIdx, 0, sampleSize, extractor.sampleTime, 0)
+                            extractor.advance()
+                        }
+                    }
+                }
+
+                val outIdx = codec.dequeueOutputBuffer(bufferInfo, 5000)
+                if (outIdx >= 0) {
+                    val outBuf = codec.getOutputBuffer(outIdx)
+                    if (outBuf != null && bufferInfo.size > 0) {
+                        outBuf.order(ByteOrder.LITTLE_ENDIAN)
+                        val shortBuf = outBuf.asShortBuffer()
+                        val totalShorts = bufferInfo.size / 2
+                        var i = 0
+                        while (i < totalShorts && bassList.size < maxFrames) {
+                            val s = shortBuf.get(i) / 32768.0
+                            lp += lpAlpha * (s - lp)
+                            bassAcc += lp * lp
+                            rmsAcc += s * s
+                            accCount++
+                            if (accCount >= hopSamples) {
+                                bassList.add(sqrt(bassAcc / accCount).toFloat())
+                                rmsList.add(sqrt(rmsAcc / accCount).toFloat())
+                                bassAcc = 0.0
+                                rmsAcc = 0.0
+                                accCount = 0
+                            }
+                            i += channels
+                        }
+                    }
+                    codec.releaseOutputBuffer(outIdx, false)
+                    if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                        outputDone = true
+                    }
+                }
+            }
+
+            val numFrames = bassList.size
+            if (numFrames < 400) return@withContext Mp3BeatAnalysis()
+
+            val nonZero = rmsList.filter { it > 0.002f }.sorted()
+            val medianRms = if (nonZero.isNotEmpty()) nonZero[nonZero.size / 2] else 0.05f
+            val silenceThresh = maxOf(0.003f, medianRms * 0.08f)
+
+            var firstAudibleFrame = 0
+            while (firstAudibleFrame < numFrames && rmsList[firstAudibleFrame] < silenceThresh) {
+                firstAudibleFrame++
+            }
+            val framesPerSec = sampleRate.toDouble() / hopSamples
+            val firstAudibleSec = firstAudibleFrame / framesPerSec
+
+            val bpmOnset = FloatArray(numFrames)
+            val kickOnset = FloatArray(numFrames)
+            for (f in 1 until numFrames) {
+                val dBass = (bassList[f] - bassList[f - 1]).coerceAtLeast(0f)
+                val dFull = (rmsList[f] - rmsList[f - 1]).coerceAtLeast(0f)
+                bpmOnset[f] = dBass * 0.72f + dFull * 0.28f
+                kickOnset[f] = dBass * 0.90f + dFull * 0.10f
+            }
+
+            fun sampleArr(arr: FloatArray, idxFloat: Double): Double {
+                val i0 = floor(idxFloat).toInt()
+                val frac = idxFloat - i0
+                if (i0 < 0 || i0 + 1 >= numFrames) return 0.0
+                return arr[i0] * (1.0 - frac) + arr[i0 + 1] * frac
+            }
+
+            fun scoreBpmComb(bpmVal: Double, highLag: Boolean): Double {
+                val periodFrames = (60.0 / bpmVal) * framesPerSec
+                val maxMult = if (highLag) 24.0 else 8.0
+                val limit = numFrames - ceil(periodFrames * maxMult).toInt() - 2
+                if (limit <= 20) return -1.0
+
+                var corr = 0.0
+                if (highLag) {
+                    for (i in 0 until limit) {
+                        corr += bpmOnset[i] * (
+                            sampleArr(bpmOnset, i + periodFrames) +
+                                0.85 * sampleArr(bpmOnset, i + periodFrames * 2.0) +
+                                0.7 * sampleArr(bpmOnset, i + periodFrames * 4.0) +
+                                0.55 * sampleArr(bpmOnset, i + periodFrames * 8.0) +
+                                0.45 * sampleArr(bpmOnset, i + periodFrames * 16.0) +
+                                0.35 * sampleArr(bpmOnset, i + periodFrames * 24.0)
+                            )
+                    }
+                } else {
+                    for (i in 0 until limit) {
+                        corr += bpmOnset[i] * (
+                            sampleArr(bpmOnset, i + periodFrames) +
+                                0.8 * sampleArr(bpmOnset, i + periodFrames * 2.0) +
+                                0.6 * sampleArr(bpmOnset, i + periodFrames * 4.0) +
+                                0.45 * sampleArr(bpmOnset, i + periodFrames * 8.0)
+                            )
+                    }
+                }
+                return corr / limit
+            }
+
+            // Estágio 1: busca focada 92–138 BPM (músicas em torno de 110–120 BPM)
+            var coarseBpm = 115.0
+            var bestScore = -1.0
+            var bpm = 92.0
+            while (bpm <= 138.0) {
+                val sc = scoreBpmComb(bpm, highLag = false)
+                if (sc > bestScore) {
+                    bestScore = sc
+                    coarseBpm = bpm
+                }
+                bpm += 0.25
+            }
+
+            // Estágio 2: busca fina ±1.5 BPM em passo de 0.005 BPM
+            var exactBpm = coarseBpm
+            var bestFineScore = -1.0
+            val fineLow = maxOf(90.0, coarseBpm - 1.5)
+            val fineHigh = minOf(140.0, coarseBpm + 1.5)
+            bpm = fineLow
+            while (bpm <= fineHigh) {
+                val sc = scoreBpmComb(bpm, highLag = true)
+                if (sc > bestFineScore) {
+                    bestFineScore = sc
+                    exactBpm = bpm
+                }
+                bpm += 0.005
+            }
+
+            // Polimento ultrafino ±0.04 BPM em passo de 0.001 BPM
+            val polishLow = maxOf(90.0, exactBpm - 0.04)
+            val polishHigh = minOf(140.0, exactBpm + 0.04)
+            var bestPolishScore = bestFineScore
+            bpm = polishLow
+            while (bpm <= polishHigh) {
+                val sc = scoreBpmComb(bpm, highLag = true)
+                if (sc > bestPolishScore) {
+                    bestPolishScore = sc
+                    exactBpm = bpm
+                }
+                bpm += 0.001
+            }
+
+            exactBpm = (exactBpm * 1000.0).roundToInt() / 1000.0
+
+            // Estágio 3: busca de fase interpolada (1 ms) usando kickOnset
+            val periodSec = 60.0 / exactBpm
+            val periodMs = periodSec * 1000.0
+            var bestOffsetMs = 0
+            var bestPhaseScore = -1.0
+            var offMs = 0.0
+            while (offMs < periodMs) {
+                var score = 0.0
+                var tMs = offMs
+                while (tMs < 44_000.0) {
+                    val fFloat = (tMs / 1000.0) * framesPerSec
+                    if (fFloat >= 1.0 && fFloat < numFrames - 1) {
+                        score += sampleArr(kickOnset, fFloat) * 1.4 +
+                            sampleArr(kickOnset, fFloat - 0.8) * 0.35 +
+                            sampleArr(kickOnset, fFloat + 0.8) * 0.35
+                    }
+                    tMs += periodMs
+                }
+                if (score > bestPhaseScore) {
+                    bestPhaseScore = score
+                    bestOffsetMs = offMs.roundToInt()
+                }
+                offMs += 1.0
+            }
+
+            fun measureLowEndPunch(candMs: Int): Double {
+                var punch = 0.0
+                var tMs = candMs.toDouble()
+                var count = 0
+                while (count < 48 && tMs < 44_000.0) {
+                    val idx = (tMs / 1000.0) * framesPerSec
+                    if (idx >= 1.0 && idx < numFrames - 1) {
+                        punch += sampleArr(kickOnset, idx)
+                    }
+                    tMs += periodMs
+                    count++
+                }
+                return punch
+            }
+
+            val periodInt = periodMs.roundToInt().coerceAtLeast(250)
+            val halfCand = (bestOffsetMs + periodInt / 2) % periodInt
+            if (measureLowEndPunch(halfCand) > measureLowEndPunch(bestOffsetMs) * 1.15) {
+                bestOffsetMs = halfCand
+            }
+
+            // Compensação do centro da janela (~6 ms) para coincidir com o início do ataque do bumbo
+            val hopLeadMs = (600.0 / framesPerSec).roundToInt()
+            bestOffsetMs = (((bestOffsetMs - hopLeadMs) % periodInt) + periodInt) % periodInt
+
+            val offsetSec = bestOffsetMs / 1000.0
+            var trimStartMs = 0
+            var loopStartSec = offsetSec
+            if (firstAudibleSec > 0.25) {
+                val kFirst = ceil((firstAudibleSec - offsetSec) / periodSec).toInt()
+                loopStartSec = maxOf(offsetSec, offsetSec + kFirst * periodSec)
+                trimStartMs = maxOf(0, ((loopStartSec - 0.03) * 1000.0).roundToInt())
+            }
+
+            var loopEndMs = 0
+            if (totalDurationSec > 8.0) {
+                val usableEnd = totalDurationSec - 0.12
+                val nBeats = floor((usableEnd - loopStartSec) / periodSec).toInt()
+                if (nBeats >= 8) {
+                    loopEndMs = ((loopStartSec + nBeats * periodSec) * 1000.0).roundToInt()
+                }
+            }
+
+            Mp3BeatAnalysis(
+                detectedBpm = exactBpm.roundToInt(),
+                exactBpm = exactBpm.toFloat(),
+                beatOffsetMs = bestOffsetMs,
+                trimStartMs = trimStartMs,
+                loopEndMs = loopEndMs
+            )
+        } catch (_: Exception) {
+            Mp3BeatAnalysis()
+        } finally {
+            try {
+                codec?.stop()
+                codec?.release()
+            } catch (_: Exception) {
+            }
+            try {
+                extractor.release()
+            } catch (_: Exception) {
+            }
+        }
+    }
+}
+
+
+================================================================================
+FILE: app/src/main/java/br/com/cronometrorcp/model/RcpModels.kt
+================================================================================
+
+package br.com.cronometrorcp.model
+
+import java.util.UUID
+
+enum class RcpMode(val label: String) {
+    ADULTO_ACLS("Adulto — ACLS"),
+    PEDIATRICO_PALS("Pediátrico — PALS"),
+    NEONATAL("Neonatal")
+}
+
+enum class CompressionPattern(
+    val label: String,
+    val compressionsCount: Int,
+    val ventilationsCount: Int,
+    val isContinuous: Boolean
+) {
+    RATIO_30_2("30:2 (Compressões / Ventilações)", 30, 2, false),
+    RATIO_15_2("15:2 (2 Socorristas Ped)", 15, 2, false),
+    RATIO_3_1("3:1 (Neonatal)", 3, 1, false),
+    CONTINUOUS("Contínuas (Via aérea avançada)", 0, 0, true)
+}
+
+enum class ReminderKey(val title: String) {
+    ADRENALINA("Adrenalina (a cada 4 min)"),
+    AMIODARONA("Amiodarona (intervalo adicional)"),
+    ANTIARRITMICO("Outro antiarrítmico"),
+    CHOQUE("Choque"),
+    VERIFICAR_RITMO("Verificação de ritmo"),
+    TROCAR_COMPRESSOR("Troca de compressor")
+}
+
+data class VoiceReminderConfig(
+    val enabled: Boolean,
+    val intervalSeconds: Int,
+    val message: String
+)
+
+data class AmiodaronaProtocolConfig(
+    val enabled: Boolean = true,
+    val firstDoseAfterShock: Int = 3,
+    val secondDoseAfterShock: Int = 5,
+    val firstDoseMessage: String = "Momento indicado para primeira dose de amiodarona, após o terceiro choque, conforme protocolo.",
+    val secondDoseMessage: String = "Momento indicado para segunda dose de amiodarona, após o quinto choque, conforme protocolo."
+)
+
+data class FiveHsTsConfig(
+    val enabled: Boolean = true,
+    val initialPromptDelaySeconds: Int = 15,
+    val tipIntervalSeconds: Int = 45,
+    val initialPromptMessage: String = "Avalie causas reversíveis: cinco agás e cinco tês."
+)
+
+data class ReversibleCauseTip(
+    val id: String,
+    val group: String,
+    val title: String,
+    val shortHint: String,
+    val spokenTip: String
+)
+
+data class VoiceMessages(
+    val compressionsCue: String = "Compressões.",
+    val ventilationsCue: String = "Ventilações.",
+    val thirtySecondsCue: String = "Trinta segundos para verificação de ritmo.",
+    val compressorPreWarningEnabled: Boolean = true,
+    val compressorPreWarningCue: String = "Quinze segundos para trocar o compressor.",
+    val adrenalinaPreWarningEnabled: Boolean = true,
+    val adrenalinaPreWarningCue: String = "Trinta segundos para aplicar adrenalina.",
+    val cycleCompletedCue: String = "Ciclo concluído. Verifique o ritmo. Prepare-se para trocar o compressor."
+)
+
+data class ModeConfig(
+    val mode: RcpMode,
+    val cycleDurationSeconds: Int,
+    val metronomeBpm: Int,
+    val pattern: CompressionPattern,
+    val rhythmCheckIntervalSeconds: Int,
+    val continuousVentilationIntervalSeconds: Int,
+    val announceTimeEvery10s: Boolean,
+    val voiceMessages: VoiceMessages,
+    val reminders: Map<ReminderKey, VoiceReminderConfig>,
+    val amiodaronaProtocol: AmiodaronaProtocolConfig = AmiodaronaProtocolConfig(),
+    val fiveHsTs: FiveHsTsConfig = FiveHsTsConfig()
+)
+
+enum class RhythmAudioSource(val label: String) {
+    METRONOME_ONLY("Somente Metrônomo (Bips)"),
+    MP3_ONLY("Somente Arquivo MP3"),
+    MP3_AND_METRONOME("MP3 + Metrônomo (Bips)")
+}
+
+data class AudioSettings(
+    val voiceVolume: Float = 0.85f,
+    val metronomeVolume: Float = 1.0f,
+    val mp3Volume: Float = 0.55f,
+    val alarmVolume: Float = 0.85f,
+    val isMuted: Boolean = false,
+    val rhythmSource: RhythmAudioSource = RhythmAudioSource.METRONOME_ONLY,
+    val mp3UriString: String? = null,
+    val mp3DisplayName: String? = null,
+    val mp3OriginalBpm: Int = 110,
+    val mp3ExactBpm: Float = 110f,
+    val mp3BeatOffsetMs: Int = 0,
+    val mp3TrimStartMs: Int = 0,
+    val mp3LoopEndMs: Int = 0,
+    val mp3SyncSpeed: Boolean = true,
+    val followMusicRhythm: Boolean = true
+)
+
+enum class RcpEventType(val label: String, val spokenConfirmation: String) {
+    CHOQUE("Choque", "Choque registrado."),
+    ADRENALINA("Adrenalina", "Adrenalina registrada."),
+    AMIODARONA("Amiodarona", "Amiodarona registrada."),
+    OUTRO_ANTIARRITMICO("Outro antiarrítmico", "Outro antiarrítmico registrado."),
+    VERIFICAR_RITMO("Verificar ritmo", "Verificação de ritmo registrada."),
+    TROCAR_COMPRESSOR("Trocar compressor", "Troca de compressor registrada."),
+    INTUBACAO("Intubação", "Intubação registrada. Compressões contínuas sem pausas para ventilação."),
+    ACESSO("Acesso", "Acesso registrado."),
+    PERSONALIZADO("Evento personalizado", "Evento registrado.")
+}
+
+data class RcpEventRecord(
+    val id: String = UUID.randomUUID().toString(),
+    val type: RcpEventType,
+    val customTitle: String? = null,
+    val elapsedSeconds: Int,
+    val cycleNumber: Int,
+    val timestampIso: String
+) {
+    val displayLabel: String
+        get() = if (type == RcpEventType.PERSONALIZADO && !customTitle.isNullOrBlank()) {
+            customTitle
+        } else {
+            type.label
+        }
+}
+
+data class RcpSessionRecord(
+    val id: String = UUID.randomUUID().toString(),
+    val startedAtIso: String,
+    val mode: RcpMode,
+    val totalDurationSeconds: Int,
+    val completedCycles: Int,
+    val shocksCount: Int,
+    val medicationsCount: Int,
+    val compressorSwitchesCount: Int,
+    val events: List<RcpEventRecord>
+)
+
+data class RcpTimerState(
+    val isRunning: Boolean = false,
+    val isPaused: Boolean = false,
+    val activeMode: RcpMode = RcpMode.ADULTO_ACLS,
+    val cycleNumber: Int = 1,
+    val cycleRemainingSeconds: Int = 120,
+    val totalElapsedSeconds: Int = 0,
+    val currentPhaseLabel: String = "Pronto",
+    val beatTick: Long = 0L,
+    val adrenalinaRemainingSeconds: Int? = 240,
+    val adrenalinaDue: Boolean = false,
+    val isIntubated: Boolean = false,
+    val shocksCount: Int = 0,
+    val amiodaronaCount: Int = 0,
+    val currentFiveHsTsTip: ReversibleCauseTip? = null,
+    val events: List<RcpEventRecord> = emptyList()
+)
+
+object RcpDefaults {
+    const val DISCLAIMER_TEXT =
+        "Ferramenta de apoio ao treinamento e à organização do atendimento. Não substitui protocolo institucional, monitoramento, desfibrilador ou julgamento clínico."
+
+    val FIVE_HS_AND_FIVE_TS = listOf(
+        ReversibleCauseTip(
+            "h1", "5Hs", "Hipovolemia",
+            "Avalie perda volêmica, hemorragia e reposição.",
+            "Cinco agás: considere hipovolemia."
+        ),
+        ReversibleCauseTip(
+            "t1", "5Ts", "Tensão no tórax (Pneumotórax hipertensivo)",
+            "Cheque ausculta assimétrica, desvio de traqueia e descompressão.",
+            "Cinco tês: considere pneumotórax hipertensivo."
+        ),
+        ReversibleCauseTip(
+            "h2", "5Hs", "Hipóxia",
+            "Verifique oxigenação, via aérea pérvia, ventilação e posição do tubo.",
+            "Cinco agás: considere hipóxia."
+        ),
+        ReversibleCauseTip(
+            "t2", "5Ts", "Tamponamento cardíaco",
+            "Avalie bulhas abafadas, turgência jugular e ultrassom à beira-leito.",
+            "Cinco tês: considere tamponamento cardíaco."
+        ),
+        ReversibleCauseTip(
+            "h3", "5Hs", "Hidrogênio (Acidose)",
+            "Avalie ventilação adequada e possível distúrbio ácido-básico.",
+            "Cinco agás: considere acidose."
+        ),
+        ReversibleCauseTip(
+            "t3", "5Ts", "Toxinas (Intoxicações)",
+            "Revise exposição a medicamentos, drogas e eventuais antídotos.",
+            "Cinco tês: considere toxinas ou intoxicações."
+        ),
+        ReversibleCauseTip(
+            "h4", "5Hs", "Hipo / Hipercalemia",
+            "Considere distúrbios de potássio, função renal e alterações no traçado.",
+            "Cinco agás: considere hipo ou hipercalemia."
+        ),
+        ReversibleCauseTip(
+            "t4", "5Ts", "Trombose pulmonar (TEP)",
+            "Avalie fatores de risco para tromboembolismo pulmonar.",
+            "Cinco tês: considere tromboembolismo pulmonar."
+        ),
+        ReversibleCauseTip(
+            "h5", "5Hs", "Hipotermia",
+            "Verifique temperatura corporal e necessidade de reaquecimento.",
+            "Cinco agás: considere hipotermia."
+        ),
+        ReversibleCauseTip(
+            "t5", "5Ts", "Trombose coronariana (IAM)",
+            "Considere síndrome coronariana aguda como causa da parada.",
+            "Cinco tês: considere trombose coronariana."
+        )
+    )
+
+    fun defaultConfigs(): Map<RcpMode, ModeConfig> = mapOf(
+        RcpMode.ADULTO_ACLS to ModeConfig(
+            mode = RcpMode.ADULTO_ACLS,
+            cycleDurationSeconds = 120,
+            metronomeBpm = 110,
+            pattern = CompressionPattern.RATIO_30_2,
+            rhythmCheckIntervalSeconds = 120,
+            continuousVentilationIntervalSeconds = 6,
+            announceTimeEvery10s = true,
+            voiceMessages = VoiceMessages(),
+            reminders = mapOf(
+                ReminderKey.ADRENALINA to VoiceReminderConfig(
+                    true, 240, "Momento de aplicação da adrenalina. Intervalo de quatro minutos."
+                ),
+                ReminderKey.AMIODARONA to VoiceReminderConfig(false, 300, "Avaliar amiodarona conforme ritmo chocável."),
+                ReminderKey.ANTIARRITMICO to VoiceReminderConfig(false, 300, "Lembrete de antiarrítmico."),
+                ReminderKey.CHOQUE to VoiceReminderConfig(false, 120, "Avaliar necessidade de choque conforme protocolo."),
+                ReminderKey.VERIFICAR_RITMO to VoiceReminderConfig(true, 120, "Verificar ritmo."),
+                ReminderKey.TROCAR_COMPRESSOR to VoiceReminderConfig(true, 120, "Trocar o compressor.")
+            )
+        ),
+        RcpMode.PEDIATRICO_PALS to ModeConfig(
+            mode = RcpMode.PEDIATRICO_PALS,
+            cycleDurationSeconds = 120,
+            metronomeBpm = 110,
+            pattern = CompressionPattern.RATIO_15_2,
+            rhythmCheckIntervalSeconds = 120,
+            continuousVentilationIntervalSeconds = 3,
+            announceTimeEvery10s = true,
+            voiceMessages = VoiceMessages(),
+            reminders = mapOf(
+                ReminderKey.ADRENALINA to VoiceReminderConfig(
+                    true, 240, "Momento de aplicação da adrenalina pediátrica. Intervalo de quatro minutos."
+                ),
+                ReminderKey.AMIODARONA to VoiceReminderConfig(false, 300, "Avaliar amiodarona pediátrica."),
+                ReminderKey.ANTIARRITMICO to VoiceReminderConfig(false, 300, "Lembrete de antiarrítmico pediátrico."),
+                ReminderKey.CHOQUE to VoiceReminderConfig(false, 120, "Avaliar choque pediátrico conforme protocolo."),
+                ReminderKey.VERIFICAR_RITMO to VoiceReminderConfig(true, 120, "Verificar ritmo."),
+                ReminderKey.TROCAR_COMPRESSOR to VoiceReminderConfig(true, 120, "Trocar o compressor.")
+            ),
+            amiodaronaProtocol = AmiodaronaProtocolConfig(
+                enabled = true,
+                firstDoseAfterShock = 3,
+                secondDoseAfterShock = 5,
+                firstDoseMessage = "Momento indicado para primeira dose de amiodarona pediátrica, após o terceiro choque.",
+                secondDoseMessage = "Momento indicado para segunda dose de amiodarona pediátrica, após o quinto choque."
+            )
+        ),
+        RcpMode.NEONATAL to ModeConfig(
+            mode = RcpMode.NEONATAL,
+            cycleDurationSeconds = 60,
+            metronomeBpm = 120,
+            pattern = CompressionPattern.RATIO_3_1,
+            rhythmCheckIntervalSeconds = 60,
+            continuousVentilationIntervalSeconds = 2,
+            announceTimeEvery10s = true,
+            voiceMessages = VoiceMessages(
+                thirtySecondsCue = "Trinta segundos para reavaliação.",
+                cycleCompletedCue = "Ciclo concluído. Verifique o ritmo. Prepare-se para trocar o compressor."
+            ),
+            reminders = mapOf(
+                ReminderKey.ADRENALINA to VoiceReminderConfig(
+                    true, 240, "Momento de avaliar aplicação da adrenalina. Intervalo de quatro minutos."
+                ),
+                ReminderKey.AMIODARONA to VoiceReminderConfig(false, 300, "Avaliar antiarrítmico conforme protocolo."),
+                ReminderKey.ANTIARRITMICO to VoiceReminderConfig(false, 300, "Lembrete de medicação."),
+                ReminderKey.CHOQUE to VoiceReminderConfig(false, 120, "Avaliar ritmo neonatal."),
+                ReminderKey.VERIFICAR_RITMO to VoiceReminderConfig(true, 60, "Reavaliar frequência cardíaca e ritmo."),
+                ReminderKey.TROCAR_COMPRESSOR to VoiceReminderConfig(true, 120, "Trocar o compressor.")
+            ),
+            amiodaronaProtocol = AmiodaronaProtocolConfig(enabled = false),
+            fiveHsTs = FiveHsTsConfig(enabled = true, tipIntervalSeconds = 60)
+        )
+    )
+}
+
+fun formatMmSs(totalSeconds: Int): String {
+    val safe = totalSeconds.coerceAtLeast(0)
+    val mins = safe / 60
+    val secs = safe % 60
+    return "%02d:%02d".format(mins, secs)
+}
+
+fun formatSpokenPtBrTime(totalSeconds: Int): String {
+    val safe = totalSeconds.coerceAtLeast(0)
+    val mins = safe / 60
+    val secs = safe % 60
+
+    val minText = when (mins) {
+        0 -> ""
+        1 -> "Um minuto"
+        2 -> "Dois minutos"
+        3 -> "Três minutos"
+        4 -> "Quatro minutos"
+        5 -> "Cinco minutos"
+        else -> "$mins minutos"
+    }
+
+    val secText = when (secs) {
+        0 -> ""
+        10 -> "dez segundos"
+        20 -> "vinte segundos"
+        30 -> "trinta segundos"
+        40 -> "quarenta segundos"
+        50 -> "cinquenta segundos"
+        else -> "$secs segundos"
+    }
+
+    return when {
+        minText.isNotEmpty() && secText.isNotEmpty() -> "$minText e $secText."
+        minText.isNotEmpty() -> "$minText."
+        secText.isNotEmpty() -> secText.replaceFirstChar { it.uppercase() } + "."
+        else -> "Zero segundos."
+    }
+}
+
+
+================================================================================
+FILE: app/src/main/java/br/com/cronometrorcp/ui/MainScreen.kt
+================================================================================
+
+package br.com.cronometrorcp.ui
+
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import br.com.cronometrorcp.model.*
+import br.com.cronometrorcp.ui.theme.*
+
+@Composable
+fun MainScreen(
+    timerState: RcpTimerState,
+    audioSettings: AudioSettings,
+    activeConfig: ModeConfig,
+    onSelectMode: (RcpMode) -> Unit,
+    onStartRcp: () -> Unit,
+    onTogglePause: () -> Unit,
+    onFinishRcp: () -> Unit,
+    onToggleMute: () -> Unit,
+    onUpdateAudio: ((AudioSettings) -> AudioSettings) -> Unit,
+    onPickMp3File: () -> Unit,
+    onRegisterEvent: (RcpEventType, String?) -> Unit,
+    onOpenSettings: () -> Unit,
+    onOpenHistory: () -> Unit
+) {
+    var showCustomDialog by remember { mutableStateOf(false) }
+    var customEventText by remember { mutableStateOf("") }
+    var showAudioSliders by remember { mutableStateOf(false) }
+    var showFinishConfirm by remember { mutableStateOf(false) }
+    var showFiveHsDialog by remember { mutableStateOf(false) }
+
+    val scrollState = rememberScrollState()
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(RcpBackground)
+            .verticalScroll(scrollState)
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        if (!timerState.isRunning) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Cronômetro RCP com Áudio",
+                    color = RcpTextPrimary,
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(onClick = onOpenSettings) {
+                        Text("Modos", color = RcpTextSecondary, fontSize = 14.sp)
+                    }
+                    TextButton(onClick = onOpenHistory) {
+                        Text("Histórico", color = RcpTextSecondary, fontSize = 14.sp)
+                    }
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                RcpMode.entries.forEach { mode ->
+                    val selected = timerState.activeMode == mode
+                    OutlinedButton(
+                        onClick = { onSelectMode(mode) },
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            containerColor = if (selected) RcpEmerald.copy(alpha = 0.18f) else RcpSurface,
+                            contentColor = if (selected) RcpEmerald else RcpTextSecondary
+                        ),
+                        border = BorderStroke(
+                            width = 1.dp,
+                            color = if (selected) RcpEmerald else RcpBorder
+                        ),
+                        contentPadding = PaddingValues(horizontal = 6.dp)
+                    ) {
+                        Text(
+                            text = when (mode) {
+                                RcpMode.ADULTO_ACLS -> "Adulto ACLS"
+                                RcpMode.PEDIATRICO_PALS -> "Ped PALS"
+                                RcpMode.NEONATAL -> "Neonatal"
+                            },
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            }
+        } else {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "${timerState.activeMode.label} · Ciclo ${timerState.cycleNumber}",
+                    color = RcpTextPrimary,
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    text = "Total ${formatMmSs(timerState.totalElapsedSeconds)}",
+                    color = RcpTextSecondary,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+
+        // Cartão do Cronômetro Gigante
+        val isWarning = timerState.isRunning && timerState.cycleRemainingSeconds <= 30
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(20.dp),
+            color = RcpSurface,
+            border = BorderStroke(
+                width = 1.5.dp,
+                color = when {
+                    !timerState.isRunning -> RcpBorder
+                    timerState.isPaused -> RcpAmber
+                    isWarning -> RcpRed
+                    else -> RcpEmerald.copy(alpha = 0.6f)
+                }
+            )
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 18.dp, horizontal = 16.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text(
+                    text = if (timerState.isRunning) {
+                        if (timerState.isPaused) "PAUSADO" else timerState.currentPhaseLabel
+                    } else {
+                        "${activeConfig.metronomeBpm} bpm · ${if (timerState.isIntubated) "Contínuas (Intubado)" else activeConfig.pattern.label}"
+                    },
+                    color = when {
+                        timerState.isPaused -> RcpAmber
+                        isWarning -> Color(0xFFFCA5A5)
+                        else -> RcpTextSecondary
+                    },
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+
+                Text(
+                    text = formatMmSs(timerState.cycleRemainingSeconds),
+                    color = when {
+                        timerState.isPaused -> RcpAmber
+                        isWarning -> Color(0xFFF87171)
+                        else -> RcpTextPrimary
+                    },
+                    fontSize = 84.sp,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.ExtraBold,
+                    letterSpacing = (-2).sp,
+                    textAlign = TextAlign.Center
+                )
+
+                Text(
+                    text = if (timerState.isRunning) {
+                        "Ciclo ${timerState.cycleNumber} · ${activeConfig.metronomeBpm} compressões/min"
+                    } else {
+                        "Ciclo de ${formatMmSs(activeConfig.cycleDurationSeconds)}"
+                    },
+                    color = RcpTextSecondary,
+                    fontSize = 13.sp
+                )
+            }
+        }
+
+        // Controles Principais Gigantes
+        if (!timerState.isRunning) {
+            Button(
+                onClick = onStartRcp,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(68.dp),
+                shape = RoundedCornerShape(16.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = RcpEmerald,
+                    contentColor = Color.Black
+                )
+            ) {
+                Text(
+                    text = "Iniciar RCP",
+                    fontSize = 22.sp,
+                    fontWeight = FontWeight.ExtraBold
+                )
+            }
+        } else {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Button(
+                    onClick = onTogglePause,
+                    modifier = Modifier
+                        .weight(1.4f)
+                        .height(64.dp),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (timerState.isPaused) RcpEmerald else RcpAmber,
+                        contentColor = Color.Black
+                    )
+                ) {
+                    Text(
+                        text = if (timerState.isPaused) "Retomar" else "Pausar",
+                        fontSize = 20.sp,
+                        fontWeight = FontWeight.ExtraBold
+                    )
+                }
+
+                OutlinedButton(
+                    onClick = { showFinishConfirm = true },
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(64.dp),
+                    shape = RoundedCornerShape(16.dp),
+                    border = BorderStroke(1.5.dp, RcpRed),
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        containerColor = RcpRed.copy(alpha = 0.16f),
+                        contentColor = Color(0xFFFCA5A5)
+                    )
+                ) {
+                    Text(
+                        text = "Encerrar",
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+        }
+
+        // Silenciar áudio + Volumes
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Button(
+                onClick = onToggleMute,
+                modifier = Modifier
+                    .weight(1.5f)
+                    .height(54.dp),
+                shape = RoundedCornerShape(14.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (audioSettings.isMuted) RcpRed else RcpSurfaceElevated,
+                    contentColor = RcpTextPrimary
+                ),
+                border = BorderStroke(1.dp, if (audioSettings.isMuted) RcpRed else RcpBorder)
+            ) {
+                Text(
+                    text = if (audioSettings.isMuted) "Áudio silenciado (Toque para ativar)" else "Silenciar áudio",
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+
+            OutlinedButton(
+                onClick = { showAudioSliders = !showAudioSliders },
+                modifier = Modifier
+                    .weight(0.7f)
+                    .height(54.dp),
+                shape = RoundedCornerShape(14.dp),
+                border = BorderStroke(1.dp, RcpBorder),
+                colors = ButtonDefaults.outlinedButtonColors(
+                    containerColor = RcpSurface,
+                    contentColor = RcpTextPrimary
+                )
+            ) {
+                Text("Volumes", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+            }
+        }
+
+        if (!timerState.isRunning) {
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(14.dp),
+                color = RcpSurface,
+                border = BorderStroke(1.dp, RcpBorder)
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = audioSettings.mp3DisplayName ?: "Música MP3 (~110 bpm)",
+                                color = RcpTextPrimary,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            val exactBpm = if (audioSettings.mp3ExactBpm > 1f) audioSettings.mp3ExactBpm else audioSettings.mp3OriginalBpm.toFloat()
+                            val speedRatio = if (audioSettings.mp3SyncSpeed && exactBpm > 1f) {
+                                (activeConfig.metronomeBpm / exactBpm).coerceIn(0.85f, 1.18f)
+                            } else 1.0f
+                            Text(
+                                text = if (audioSettings.mp3UriString != null) {
+                                    if (audioSettings.mp3SyncSpeed) {
+                                        "${"%.1f".format(exactBpm).replace(".0", "")} bpm original · Ajustada para ${activeConfig.metronomeBpm} bpm (${"%.2f".format(speedRatio)}x)"
+                                    } else {
+                                        "${"%.1f".format(exactBpm).replace(".0", "")} bpm · Metrônomo acompanha"
+                                    }
+                                } else {
+                                    "Opcional: selecione um MP3 do aparelho"
+                                },
+                                color = RcpTextSecondary,
+                                fontSize = 11.sp
+                            )
+                        }
+                        OutlinedButton(onClick = onPickMp3File) {
+                            Text(
+                                if (audioSettings.mp3UriString != null) "Trocar MP3" else "Colocar MP3",
+                                color = RcpEmerald,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+
+                    if (audioSettings.mp3UriString != null) {
+                        VolumeSliderRow("Volume da Música MP3", audioSettings.mp3Volume) { v ->
+                            onUpdateAudio { it.copy(mp3Volume = v) }
+                        }
+                        if (audioSettings.rhythmSource != RhythmAudioSource.METRONOME_ONLY) {
+                            Mp3FineTuneRow(
+                                offsetMs = audioSettings.mp3BeatOffsetMs,
+                                onAdjust = { delta ->
+                                    onUpdateAudio { prev ->
+                                        val bpm = if (prev.mp3ExactBpm > 1f) prev.mp3ExactBpm else prev.mp3OriginalBpm.toFloat()
+                                        val period = (60_000.0 / bpm.coerceAtLeast(55f)).toInt().coerceAtLeast(250)
+                                        val next = ((prev.mp3BeatOffsetMs + delta) % period + period) % period
+                                        prev.copy(mp3BeatOffsetMs = next)
+                                    }
+                                },
+                                onFlipHalfBeat = {
+                                    onUpdateAudio { prev ->
+                                        val bpm = if (prev.mp3ExactBpm > 1f) prev.mp3ExactBpm else prev.mp3OriginalBpm.toFloat()
+                                        val period = (60_000.0 / bpm.coerceAtLeast(55f)).toInt().coerceAtLeast(250)
+                                        val next = (prev.mp3BeatOffsetMs + period / 2) % period
+                                        prev.copy(mp3BeatOffsetMs = next)
+                                    }
+                                }
+                            )
+                        }
+                    }
+                }
+            }
+        } else if (audioSettings.mp3UriString != null && audioSettings.rhythmSource != RhythmAudioSource.METRONOME_ONLY) {
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(14.dp),
+                color = RcpSurface,
+                border = BorderStroke(1.dp, RcpBorder)
+            ) {
+                Box(modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
+                    Mp3FineTuneRow(
+                        offsetMs = audioSettings.mp3BeatOffsetMs,
+                        onAdjust = { delta ->
+                            onUpdateAudio { prev ->
+                                val bpm = if (prev.mp3ExactBpm > 1f) prev.mp3ExactBpm else prev.mp3OriginalBpm.toFloat()
+                                val period = (60_000.0 / bpm.coerceAtLeast(55f)).toInt().coerceAtLeast(250)
+                                val next = ((prev.mp3BeatOffsetMs + delta) % period + period) % period
+                                prev.copy(mp3BeatOffsetMs = next)
+                            }
+                        },
+                        onFlipHalfBeat = {
+                            onUpdateAudio { prev ->
+                                val bpm = if (prev.mp3ExactBpm > 1f) prev.mp3ExactBpm else prev.mp3OriginalBpm.toFloat()
+                                val period = (60_000.0 / bpm.coerceAtLeast(55f)).toInt().coerceAtLeast(250)
+                                val next = (prev.mp3BeatOffsetMs + period / 2) % period
+                                prev.copy(mp3BeatOffsetMs = next)
+                            }
+                        }
+                    )
+                }
+            }
+        }
+
+        if (showAudioSliders) {
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                color = RcpSurface,
+                border = BorderStroke(1.dp, RcpBorder)
+            ) {
+                Column(
+                    modifier = Modifier.padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        text = "Canais independentes: nenhum áudio baixa o outro.",
+                        color = RcpTextSecondary,
+                        fontSize = 11.sp
+                    )
+                    VolumeSliderRow("Volume da Voz (pt-BR)", audioSettings.voiceVolume) { v ->
+                        onUpdateAudio { it.copy(voiceVolume = v) }
+                    }
+                    VolumeSliderRow("Volume do Metrônomo (Bips)", audioSettings.metronomeVolume) { v ->
+                        onUpdateAudio { it.copy(metronomeVolume = v) }
+                    }
+                    VolumeSliderRow("Volume da Música MP3", audioSettings.mp3Volume) { v ->
+                        onUpdateAudio { it.copy(mp3Volume = v) }
+                    }
+                    VolumeSliderRow("Volume dos Alarmes", audioSettings.alarmVolume) { v ->
+                        onUpdateAudio { it.copy(alarmVolume = v) }
+                    }
+                }
+            }
+        }
+
+        // Guias de Medicação (Adrenalina 4 min, Amiodarona por choques) e 5Hs/5Ts
+        val amioCfg = activeConfig.amiodaronaProtocol
+        val amioStatusText = when {
+            !amioCfg.enabled -> "Desativado neste modo"
+            timerState.amiodaronaCount == 0 && timerState.shocksCount >= amioCfg.firstDoseAfterShock ->
+                "1ª dose indicada agora (após ${timerState.shocksCount}º choque)"
+            timerState.amiodaronaCount == 0 ->
+                "1ª dose após ${amioCfg.firstDoseAfterShock}º choque (${timerState.shocksCount}/${amioCfg.firstDoseAfterShock})"
+            timerState.amiodaronaCount == 1 && timerState.shocksCount >= amioCfg.secondDoseAfterShock ->
+                "2ª dose indicada agora (após ${timerState.shocksCount}º choque)"
+            timerState.amiodaronaCount == 1 ->
+                "1ª dose feita · 2ª após ${amioCfg.secondDoseAfterShock}º choque (${timerState.shocksCount}/${amioCfg.secondDoseAfterShock})"
+            else -> "${timerState.amiodaronaCount} doses registradas"
+        }
+
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(16.dp),
+            color = RcpSurface,
+            border = BorderStroke(1.dp, RcpBorder)
+        ) {
+            Column(
+                modifier = Modifier.padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Medicações e Causas Reversíveis", color = RcpTextSecondary, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                    TextButton(onClick = { showFiveHsDialog = true }, contentPadding = PaddingValues(0.dp)) {
+                        Text("Ver 5Hs e 5Ts", color = RcpEmerald, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+
+                val isAdreSoon = timerState.isRunning &&
+                    timerState.adrenalinaRemainingSeconds != null &&
+                    timerState.adrenalinaRemainingSeconds <= 30
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text("Adrenalina (4 min)", color = RcpTextPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        text = when {
+                            timerState.adrenalinaRemainingSeconds == null -> "Desativado"
+                            timerState.adrenalinaDue -> "Aplicar / Avaliar agora"
+                            else -> formatMmSs(timerState.adrenalinaRemainingSeconds)
+                        },
+                        color = if (timerState.adrenalinaDue || isAdreSoon) RcpAmber else RcpEmerald,
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text("Amiodarona", color = RcpTextPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        text = amioStatusText,
+                        color = RcpTextSecondary,
+                        fontSize = 12.sp,
+                        textAlign = TextAlign.End
+                    )
+                }
+
+                if (activeConfig.fiveHsTs.enabled) {
+                    HorizontalDivider(color = RcpBorder)
+                    val tip = timerState.currentFiveHsTsTip
+                    Text(
+                        text = if (tip != null) {
+                            "${tip.group} · ${tip.title}: ${tip.shortHint}"
+                        } else {
+                            "5Hs e 5Ts: lembrete inicial aos 15s e dicas nos intervalos seguros."
+                        },
+                        color = RcpTextSecondary,
+                        fontSize = 12.sp,
+                        lineHeight = 16.sp
+                    )
+                }
+            }
+        }
+
+        // Grade dos 9 Botões Grandes de Registro de Eventos
+        val eventButtons = listOf(
+            EventButtonSpec(RcpEventType.CHOQUE, RcpRed),
+            EventButtonSpec(RcpEventType.ADRENALINA, RcpAmber),
+            EventButtonSpec(RcpEventType.AMIODARONA, RcpBlue),
+            EventButtonSpec(RcpEventType.OUTRO_ANTIARRITMICO, RcpBlue),
+            EventButtonSpec(RcpEventType.VERIFICAR_RITMO, RcpTeal),
+            EventButtonSpec(RcpEventType.TROCAR_COMPRESSOR, RcpTeal),
+            EventButtonSpec(RcpEventType.INTUBACAO, RcpSurfaceElevated),
+            EventButtonSpec(RcpEventType.ACESSO, RcpSurfaceElevated),
+            EventButtonSpec(RcpEventType.PERSONALIZADO, RcpSurfaceElevated)
+        )
+
+        LazyVerticalGrid(
+            columns = GridCells.Fixed(2),
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(330.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+            userScrollEnabled = false
+        ) {
+            items(eventButtons) { spec ->
+                val isPrimaryColor = spec.accent != RcpSurfaceElevated
+                Button(
+                    onClick = {
+                        if (spec.type == RcpEventType.PERSONALIZADO) {
+                            showCustomDialog = true
+                        } else {
+                            onRegisterEvent(spec.type, null)
+                        }
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(56.dp),
+                    shape = RoundedCornerShape(14.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (isPrimaryColor) spec.accent.copy(alpha = 0.22f) else RcpSurfaceElevated,
+                        contentColor = RcpTextPrimary
+                    ),
+                    border = BorderStroke(
+                        width = 1.dp,
+                        color = if (isPrimaryColor) spec.accent else RcpBorder
+                    ),
+                    contentPadding = PaddingValues(horizontal = 10.dp)
+                ) {
+                    Text(
+                        text = spec.type.label,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+        }
+
+        if (timerState.events.isNotEmpty()) {
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(14.dp),
+                color = RcpSurface,
+                border = BorderStroke(1.dp, RcpBorder)
+            ) {
+                Column(
+                    modifier = Modifier.padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Text(
+                        text = "Registros recentes",
+                        color = RcpTextSecondary,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    timerState.events.take(4).forEach { ev ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                text = ev.displayLabel,
+                                color = RcpTextPrimary,
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.Medium
+                            )
+                            Text(
+                                text = "${formatMmSs(ev.elapsedSeconds)} · Ciclo ${ev.cycleNumber}",
+                                color = RcpTextSecondary,
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 13.sp
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        Text(
+            text = RcpDefaults.DISCLAIMER_TEXT,
+            color = RcpTextSecondary,
+            fontSize = 11.sp,
+            lineHeight = 15.sp,
+            textAlign = TextAlign.Center,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 4.dp, bottom = 8.dp)
+        )
+    }
+
+    if (showFiveHsDialog) {
+        AlertDialog(
+            onDismissRequest = { showFiveHsDialog = false },
+            containerColor = RcpSurface,
+            title = { Text("Causas Reversíveis — 5Hs e 5Ts", color = RcpTextPrimary) },
+            text = {
+                Column(
+                    modifier = Modifier.verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    RcpDefaults.FIVE_HS_AND_FIVE_TS.forEach { item ->
+                        Text(
+                            text = "${item.group} · ${item.title}",
+                            color = RcpEmerald,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = item.shortHint,
+                            color = RcpTextSecondary,
+                            fontSize = 12.sp
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showFiveHsDialog = false }) {
+                    Text("Fechar", color = RcpEmerald)
+                }
+            }
+        )
+    }
+
+    if (showCustomDialog) {
+        AlertDialog(
+            onDismissRequest = { showCustomDialog = false },
+            containerColor = RcpSurface,
+            title = { Text("Evento personalizado", color = RcpTextPrimary) },
+            text = {
+                OutlinedTextField(
+                    value = customEventText,
+                    onValueChange = { customEventText = it },
+                    label = { Text("Descrição do evento") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val text = customEventText.trim().ifBlank { "Evento personalizado" }
+                        onRegisterEvent(RcpEventType.PERSONALIZADO, text)
+                        customEventText = ""
+                        showCustomDialog = false
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = RcpEmerald, contentColor = Color.Black)
+                ) {
+                    Text("Registrar")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showCustomDialog = false }) {
+                    Text("Cancelar", color = RcpTextSecondary)
+                }
+            }
+        )
+    }
+
+    if (showFinishConfirm) {
+        AlertDialog(
+            onDismissRequest = { showFinishConfirm = false },
+            containerColor = RcpSurface,
+            title = { Text("Encerrar e salvar atendimento?", color = RcpTextPrimary) },
+            text = {
+                Text(
+                    "O cronômetro será encerrado e o histórico completo será salvo localmente.",
+                    color = RcpTextSecondary
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showFinishConfirm = false
+                        onFinishRcp()
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = RcpRed, contentColor = Color.White)
+                ) {
+                    Text("Encerrar RCP")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showFinishConfirm = false }) {
+                    Text("Continuar RCP", color = RcpTextSecondary)
+                }
+            }
+        )
+    }
+}
+
+private data class EventButtonSpec(val type: RcpEventType, val accent: Color)
+
+@Composable
+fun VolumeSliderRow(
+    label: String,
+    value: Float,
+    minValue: Float = 0f,
+    onChange: (Float) -> Unit
+) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text(label, color = RcpTextPrimary, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+            Text("${(value * 100).toInt()}%", color = RcpTextSecondary, fontFamily = FontFamily.Monospace, fontSize = 13.sp)
+        }
+        Slider(
+            value = value.coerceIn(minValue, 1f),
+            onValueChange = onChange,
+            valueRange = minValue..1f,
+            colors = SliderDefaults.colors(
+                thumbColor = RcpEmerald,
+                activeTrackColor = RcpEmerald,
+                inactiveTrackColor = RcpBorder
+            )
+        )
+    }
+}
+
+@Composable
+private fun Mp3FineTuneRow(
+    offsetMs: Int,
+    onAdjust: (Int) -> Unit,
+    onFlipHalfBeat: () -> Unit
+) {
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "Ajuste fino da batida",
+                color = RcpTextPrimary,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold
+            )
+            Text(
+                text = "$offsetMs ms",
+                color = RcpEmerald,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold
+            )
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            listOf(-25, -5, 5, 25).forEach { delta ->
+                OutlinedButton(
+                    onClick = { onAdjust(delta) },
+                    modifier = Modifier.weight(1f).height(34.dp),
+                    contentPadding = PaddingValues(horizontal = 2.dp, vertical = 0.dp),
+                    border = BorderStroke(1.dp, RcpBorder)
+                ) {
+                    Text(
+                        text = if (delta > 0) "+$delta" else "$delta",
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = RcpTextPrimary,
+                        maxLines = 1
+                    )
+                }
+            }
+            OutlinedButton(
+                onClick = onFlipHalfBeat,
+                modifier = Modifier.weight(1.25f).height(34.dp),
+                contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
+                border = BorderStroke(1.dp, RcpEmerald.copy(alpha = 0.5f))
+            ) {
+                Text(
+                    text = "½ batida",
+                    fontSize = 11.sp,
+                    color = RcpEmerald,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1
+                )
+            }
+        }
+    }
+}
+
+
+================================================================================
+FILE: app/src/main/java/br/com/cronometrorcp/ui/SettingsScreen.kt
+================================================================================
+
+package br.com.cronometrorcp.ui
+
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import br.com.cronometrorcp.model.*
+import br.com.cronometrorcp.ui.theme.*
+
+@Composable
+fun SettingsScreen(
+    modeConfigs: Map<RcpMode, ModeConfig>,
+    audioSettings: AudioSettings,
+    onUpdateModeConfig: (RcpMode, ModeConfig) -> Unit,
+    onUpdateAudio: ((AudioSettings) -> AudioSettings) -> Unit,
+    onPickMp3File: () -> Unit,
+    onRemoveMp3File: () -> Unit,
+    onBack: () -> Unit
+) {
+    var editingMode by remember { mutableStateOf(RcpMode.ADULTO_ACLS) }
+    val cfg = modeConfigs[editingMode] ?: RcpDefaults.defaultConfigs()[editingMode]!!
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(RcpBackground)
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "Modos, Áudio e Lembretes",
+                color = RcpTextPrimary,
+                fontSize = 20.sp,
+                fontWeight = FontWeight.Bold
+            )
+            TextButton(onClick = onBack) {
+                Text("Voltar", color = RcpEmerald, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+            }
+        }
+
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(16.dp),
+            color = RcpSurface,
+            border = BorderStroke(1.dp, RcpBorder)
+        ) {
+            Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Controles de Áudio", color = RcpTextPrimary, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                Text(
+                    text = "Canais independentes: MP3, metrônomo, alarmes e voz não baixam uns aos outros.",
+                    color = RcpTextSecondary,
+                    fontSize = 12.sp
+                )
+                VolumeSliderRow("Volume da Voz (pt-BR)", audioSettings.voiceVolume) { v ->
+                    onUpdateAudio { it.copy(voiceVolume = v) }
+                }
+                VolumeSliderRow("Volume do Metrônomo (Bips)", audioSettings.metronomeVolume) { v ->
+                    onUpdateAudio { it.copy(metronomeVolume = v) }
+                }
+                VolumeSliderRow("Volume da Música MP3", audioSettings.mp3Volume) { v ->
+                    onUpdateAudio { it.copy(mp3Volume = v) }
+                }
+                VolumeSliderRow("Volume dos Alarmes", audioSettings.alarmVolume) { v ->
+                    onUpdateAudio { it.copy(alarmVolume = v) }
+                }
+            }
+        }
+
+        // Arquivo MP3 local (~110 bpm)
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(16.dp),
+            color = RcpSurface,
+            border = BorderStroke(1.dp, RcpBorder)
+        ) {
+            Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("Arquivo MP3 para Ritmo (~110 bpm)", color = RcpTextPrimary, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                Text(
+                    text = audioSettings.mp3DisplayName?.let { "Carregado: $it" } ?: "Nenhum arquivo MP3 selecionado",
+                    color = RcpTextSecondary,
+                    fontSize = 13.sp
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = onPickMp3File,
+                        colors = ButtonDefaults.buttonColors(containerColor = RcpEmerald, contentColor = androidx.compose.ui.graphics.Color.Black)
+                    ) {
+                        Text(if (audioSettings.mp3UriString != null) "Trocar MP3" else "Selecionar MP3", fontWeight = FontWeight.Bold)
+                    }
+                    if (audioSettings.mp3UriString != null) {
+                        OutlinedButton(
+                            onClick = onRemoveMp3File,
+                            border = BorderStroke(1.dp, RcpRed)
+                        ) {
+                            Text("Remover", color = RcpRed)
+                        }
+                    }
+                }
+                VolumeSliderRow("Volume da Música MP3", audioSettings.mp3Volume) { v ->
+                    onUpdateAudio { it.copy(mp3Volume = v) }
+                }
+                RhythmAudioSource.entries
+                    .filter { it != RhythmAudioSource.MP3_ONLY }
+                    .forEach { src ->
+                    val selected = audioSettings.rhythmSource == src
+                    OutlinedButton(
+                        onClick = { onUpdateAudio { it.copy(rhythmSource = src) } },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(10.dp),
+                        border = BorderStroke(1.dp, if (selected) RcpEmerald else RcpBorder),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            containerColor = if (selected) RcpEmerald.copy(alpha = 0.16f) else RcpBackground,
+                            contentColor = if (selected) RcpEmerald else RcpTextPrimary
+                        )
+                    ) {
+                        Text(src.label, fontSize = 13.sp)
+                    }
+                }
+                val exactBpmVal = if (audioSettings.mp3ExactBpm > 1f) audioSettings.mp3ExactBpm else audioSettings.mp3OriginalBpm.toFloat()
+                val speedRatio = if (audioSettings.mp3SyncSpeed && exactBpmVal > 1f) {
+                    (cfg.metronomeBpm / exactBpmVal).coerceIn(0.85f, 1.18f)
+                } else 1.0f
+                val speedPct = kotlin.math.round((speedRatio - 1f) * 100f).toInt()
+                val speedLabel = when {
+                    !audioSettings.mp3SyncSpeed -> "Velocidade original (1.00x)"
+                    speedPct > 0 -> "Acelerada em ${"%.2f".format(speedRatio)}x (+$speedPct% → ${cfg.metronomeBpm} bpm)"
+                    speedPct < 0 -> "Reduzida em ${"%.2f".format(speedRatio)}x ($speedPct% → ${cfg.metronomeBpm} bpm)"
+                    else -> "Mesmo andamento (1.00x → ${cfg.metronomeBpm} bpm)"
+                }
+                if (audioSettings.mp3UriString != null) {
+                    Text(speedLabel, color = RcpEmerald, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                }
+                StepperRow(
+                    label = "BPM original do MP3",
+                    valueText = "${"%.1f".format(exactBpmVal).replace(".0", "")} bpm",
+                    onMinus = {
+                        onUpdateAudio {
+                            val cur = if (it.mp3ExactBpm > 1f) it.mp3ExactBpm else it.mp3OriginalBpm.toFloat()
+                            val next = (kotlin.math.round((cur - 0.2f) * 10f) / 10f).coerceAtLeast(88f)
+                            it.copy(mp3OriginalBpm = kotlin.math.round(next).toInt(), mp3ExactBpm = next)
+                        }
+                    },
+                    onPlus = {
+                        onUpdateAudio {
+                            val cur = if (it.mp3ExactBpm > 1f) it.mp3ExactBpm else it.mp3OriginalBpm.toFloat()
+                            val next = (kotlin.math.round((cur + 0.2f) * 10f) / 10f).coerceAtMost(142f)
+                            it.copy(mp3OriginalBpm = kotlin.math.round(next).toInt(), mp3ExactBpm = next)
+                        }
+                    }
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        "Ajustar velocidade do MP3 ao metrônomo (${cfg.metronomeBpm} bpm)",
+                        color = RcpTextPrimary,
+                        fontSize = 13.sp,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Switch(
+                        checked = audioSettings.mp3SyncSpeed,
+                        onCheckedChange = { sync -> onUpdateAudio { it.copy(mp3SyncSpeed = sync, followMusicRhythm = true) } }
+                    )
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Metrônomo acompanha BPM original do MP3", color = RcpTextPrimary, fontSize = 13.sp, modifier = Modifier.weight(1f))
+                    Switch(
+                        checked = audioSettings.followMusicRhythm,
+                        onCheckedChange = { follow -> onUpdateAudio { it.copy(followMusicRhythm = follow) } }
+                    )
+                }
+                if (audioSettings.mp3UriString != null) {
+                    Text(
+                        text = "Alinhamento fino da batida (${audioSettings.mp3BeatOffsetMs} ms)",
+                        color = RcpTextSecondary,
+                        fontSize = 12.sp
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        listOf(-25, -5, 5, 25).forEach { delta ->
+                            OutlinedButton(
+                                onClick = {
+                                    onUpdateAudio { prev ->
+                                        val bpm = if (prev.mp3ExactBpm > 1f) prev.mp3ExactBpm else prev.mp3OriginalBpm.toFloat()
+                                        val period = (60_000.0 / bpm.coerceAtLeast(55f)).toInt().coerceAtLeast(250)
+                                        val next = ((prev.mp3BeatOffsetMs + delta) % period + period) % period
+                                        prev.copy(mp3BeatOffsetMs = next)
+                                    }
+                                },
+                                modifier = Modifier.weight(1f),
+                                contentPadding = PaddingValues(horizontal = 4.dp, vertical = 4.dp)
+                            ) {
+                                Text(
+                                    text = if (delta > 0) "+$delta ms" else "$delta ms",
+                                    fontSize = 11.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = RcpTextPrimary,
+                                    maxLines = 1
+                                )
+                            }
+                        }
+                    }
+                    OutlinedButton(
+                        onClick = {
+                            onUpdateAudio { prev ->
+                                val bpm = if (prev.mp3ExactBpm > 1f) prev.mp3ExactBpm else prev.mp3OriginalBpm.toFloat()
+                                val period = (60_000.0 / bpm.coerceAtLeast(55f)).toInt().coerceAtLeast(250)
+                                val next = (prev.mp3BeatOffsetMs + period / 2) % period
+                                prev.copy(mp3BeatOffsetMs = next)
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("Inverter ½ batida", fontSize = 12.sp, color = RcpEmerald) }
+                }
+            }
+        }
+
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            RcpMode.entries.forEach { mode ->
+                val selected = editingMode == mode
+                OutlinedButton(
+                    onClick = { editingMode = mode },
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(48.dp),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        containerColor = if (selected) RcpEmerald.copy(alpha = 0.2f) else RcpSurface,
+                        contentColor = if (selected) RcpEmerald else RcpTextSecondary
+                    ),
+                    border = BorderStroke(1.dp, if (selected) RcpEmerald else RcpBorder)
+                ) {
+                    Text(
+                        text = when (mode) {
+                            RcpMode.ADULTO_ACLS -> "Adulto ACLS"
+                            RcpMode.PEDIATRICO_PALS -> "Ped PALS"
+                            RcpMode.NEONATAL -> "Neonatal"
+                        },
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1
+                    )
+                }
+            }
+        }
+
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(16.dp),
+            color = RcpSurface,
+            border = BorderStroke(1.dp, RcpBorder)
+        ) {
+            Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(cfg.mode.label, color = RcpTextPrimary, fontSize = 17.sp, fontWeight = FontWeight.Bold)
+
+                StepperRow(
+                    label = "Duração do ciclo",
+                    valueText = formatMmSs(cfg.cycleDurationSeconds),
+                    onMinus = {
+                        val next = (cfg.cycleDurationSeconds - 15).coerceAtLeast(30)
+                        onUpdateModeConfig(editingMode, cfg.copy(cycleDurationSeconds = next))
+                    },
+                    onPlus = {
+                        val next = (cfg.cycleDurationSeconds + 15).coerceAtMost(300)
+                        onUpdateModeConfig(editingMode, cfg.copy(cycleDurationSeconds = next))
+                    }
+                )
+
+                StepperRow(
+                    label = "Ritmo do metrônomo",
+                    valueText = "${cfg.metronomeBpm} bpm",
+                    onMinus = {
+                        val next = (cfg.metronomeBpm - 5).coerceAtLeast(80)
+                        onUpdateModeConfig(editingMode, cfg.copy(metronomeBpm = next))
+                    },
+                    onPlus = {
+                        val next = (cfg.metronomeBpm + 5).coerceAtMost(140)
+                        onUpdateModeConfig(editingMode, cfg.copy(metronomeBpm = next))
+                    }
+                )
+
+                StepperRow(
+                    label = "Intervalo de checagem",
+                    valueText = formatMmSs(cfg.rhythmCheckIntervalSeconds),
+                    onMinus = {
+                        val next = (cfg.rhythmCheckIntervalSeconds - 15).coerceAtLeast(30)
+                        onUpdateModeConfig(editingMode, cfg.copy(rhythmCheckIntervalSeconds = next))
+                    },
+                    onPlus = {
+                        val next = (cfg.rhythmCheckIntervalSeconds + 15).coerceAtMost(300)
+                        onUpdateModeConfig(editingMode, cfg.copy(rhythmCheckIntervalSeconds = next))
+                    }
+                )
+
+                Text("Relação Compressão / Ventilação", color = RcpTextSecondary, fontSize = 13.sp)
+                CompressionPattern.entries.forEach { pattern ->
+                    val selected = cfg.pattern == pattern
+                    OutlinedButton(
+                        onClick = { onUpdateModeConfig(editingMode, cfg.copy(pattern = pattern)) },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(10.dp),
+                        border = BorderStroke(1.dp, if (selected) RcpEmerald else RcpBorder),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            containerColor = if (selected) RcpEmerald.copy(alpha = 0.16f) else RcpBackground,
+                            contentColor = if (selected) RcpEmerald else RcpTextPrimary
+                        )
+                    ) {
+                        Text(pattern.label, fontSize = 13.sp)
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Anunciar tempo a cada 10 segundos", color = RcpTextPrimary, fontSize = 14.sp)
+                    Switch(
+                        checked = cfg.announceTimeEvery10s,
+                        onCheckedChange = { onUpdateModeConfig(editingMode, cfg.copy(announceTimeEvery10s = it)) }
+                    )
+                }
+            }
+        }
+
+        // Momentos da Amiodarona por número de choques
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(16.dp),
+            color = RcpSurface,
+            border = BorderStroke(1.dp, RcpBorder)
+        ) {
+            Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Momentos da Amiodarona", color = RcpTextPrimary, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    Switch(
+                        checked = cfg.amiodaronaProtocol.enabled,
+                        onCheckedChange = {
+                            onUpdateModeConfig(
+                                editingMode,
+                                cfg.copy(amiodaronaProtocol = cfg.amiodaronaProtocol.copy(enabled = it))
+                            )
+                        }
+                    )
+                }
+                if (cfg.amiodaronaProtocol.enabled) {
+                    StepperRow(
+                        label = "1ª dose após choque",
+                        valueText = "${cfg.amiodaronaProtocol.firstDoseAfterShock}º",
+                        onMinus = {
+                            val next = (cfg.amiodaronaProtocol.firstDoseAfterShock - 1).coerceAtLeast(1)
+                            onUpdateModeConfig(
+                                editingMode,
+                                cfg.copy(amiodaronaProtocol = cfg.amiodaronaProtocol.copy(firstDoseAfterShock = next))
+                            )
+                        },
+                        onPlus = {
+                            val next = (cfg.amiodaronaProtocol.firstDoseAfterShock + 1).coerceAtMost(10)
+                            onUpdateModeConfig(
+                                editingMode,
+                                cfg.copy(amiodaronaProtocol = cfg.amiodaronaProtocol.copy(firstDoseAfterShock = next))
+                            )
+                        }
+                    )
+                    StepperRow(
+                        label = "2ª dose após choque",
+                        valueText = "${cfg.amiodaronaProtocol.secondDoseAfterShock}º",
+                        onMinus = {
+                            val next = (cfg.amiodaronaProtocol.secondDoseAfterShock - 1)
+                                .coerceAtLeast(cfg.amiodaronaProtocol.firstDoseAfterShock + 1)
+                            onUpdateModeConfig(
+                                editingMode,
+                                cfg.copy(amiodaronaProtocol = cfg.amiodaronaProtocol.copy(secondDoseAfterShock = next))
+                            )
+                        },
+                        onPlus = {
+                            val next = (cfg.amiodaronaProtocol.secondDoseAfterShock + 1).coerceAtMost(15)
+                            onUpdateModeConfig(
+                                editingMode,
+                                cfg.copy(amiodaronaProtocol = cfg.amiodaronaProtocol.copy(secondDoseAfterShock = next))
+                            )
+                        }
+                    )
+                }
+            }
+        }
+
+        // Dicas dos 5Hs e 5Ts
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(16.dp),
+            color = RcpSurface,
+            border = BorderStroke(1.dp, RcpBorder)
+        ) {
+            Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Dicas dos 5Hs e 5Ts", color = RcpTextPrimary, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    Switch(
+                        checked = cfg.fiveHsTs.enabled,
+                        onCheckedChange = {
+                            onUpdateModeConfig(editingMode, cfg.copy(fiveHsTs = cfg.fiveHsTs.copy(enabled = it)))
+                        }
+                    )
+                }
+                if (cfg.fiveHsTs.enabled) {
+                    StepperRow(
+                        label = "Intervalo entre dicas",
+                        valueText = "${cfg.fiveHsTs.tipIntervalSeconds}s",
+                        onMinus = {
+                            val next = (cfg.fiveHsTs.tipIntervalSeconds - 5).coerceAtLeast(25)
+                            onUpdateModeConfig(editingMode, cfg.copy(fiveHsTs = cfg.fiveHsTs.copy(tipIntervalSeconds = next)))
+                        },
+                        onPlus = {
+                            val next = (cfg.fiveHsTs.tipIntervalSeconds + 5).coerceAtMost(120)
+                            onUpdateModeConfig(editingMode, cfg.copy(fiveHsTs = cfg.fiveHsTs.copy(tipIntervalSeconds = next)))
+                        }
+                    )
+                }
+            }
+        }
+
+        // Lembretes de voz por intervalo
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(16.dp),
+            color = RcpSurface,
+            border = BorderStroke(1.dp, RcpBorder)
+        ) {
+            Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text("Lembretes de Voz Configuráveis", color = RcpTextPrimary, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                ReminderKey.entries.forEach { key ->
+                    val r = cfg.reminders[key] ?: VoiceReminderConfig(false, 120, "")
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(key.title, color = RcpTextPrimary, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                            Switch(
+                                checked = r.enabled,
+                                onCheckedChange = { enabled ->
+                                    val updatedMap = cfg.reminders.toMutableMap()
+                                    updatedMap[key] = r.copy(enabled = enabled)
+                                    onUpdateModeConfig(editingMode, cfg.copy(reminders = updatedMap))
+                                }
+                            )
+                        }
+                        if (r.enabled) {
+                            StepperRow(
+                                label = "Intervalo",
+                                valueText = formatMmSs(r.intervalSeconds),
+                                onMinus = {
+                                    val updatedMap = cfg.reminders.toMutableMap()
+                                    updatedMap[key] = r.copy(intervalSeconds = (r.intervalSeconds - 30).coerceAtLeast(30))
+                                    onUpdateModeConfig(editingMode, cfg.copy(reminders = updatedMap))
+                                },
+                                onPlus = {
+                                    val updatedMap = cfg.reminders.toMutableMap()
+                                    updatedMap[key] = r.copy(intervalSeconds = (r.intervalSeconds + 30).coerceAtMost(600))
+                                    onUpdateModeConfig(editingMode, cfg.copy(reminders = updatedMap))
+                                }
+                            )
+                            OutlinedTextField(
+                                value = r.message,
+                                onValueChange = { msg ->
+                                    val updatedMap = cfg.reminders.toMutableMap()
+                                    updatedMap[key] = r.copy(message = msg)
+                                    onUpdateModeConfig(editingMode, cfg.copy(reminders = updatedMap))
+                                },
+                                label = { Text("Mensagem falada") },
+                                singleLine = true,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+                        HorizontalDivider(color = RcpBorder)
+                    }
+                }
+            }
+        }
+
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(16.dp),
+            color = RcpSurface,
+            border = BorderStroke(1.dp, RcpBorder)
+        ) {
+            Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("Mensagens de Voz do Ciclo", color = RcpTextPrimary, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                OutlinedTextField(
+                    value = cfg.voiceMessages.thirtySecondsCue,
+                    onValueChange = {
+                        onUpdateModeConfig(editingMode, cfg.copy(voiceMessages = cfg.voiceMessages.copy(thirtySecondsCue = it)))
+                    },
+                    label = { Text("Aviso aos 30 segundos") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Avisar 15s antes da troca de compressor", color = RcpTextPrimary, fontSize = 13.sp)
+                    Switch(
+                        checked = cfg.voiceMessages.compressorPreWarningEnabled,
+                        onCheckedChange = {
+                            onUpdateModeConfig(
+                                editingMode,
+                                cfg.copy(voiceMessages = cfg.voiceMessages.copy(compressorPreWarningEnabled = it))
+                            )
+                        }
+                    )
+                }
+                if (cfg.voiceMessages.compressorPreWarningEnabled) {
+                    OutlinedTextField(
+                        value = cfg.voiceMessages.compressorPreWarningCue,
+                        onValueChange = {
+                            onUpdateModeConfig(
+                                editingMode,
+                                cfg.copy(voiceMessages = cfg.voiceMessages.copy(compressorPreWarningCue = it))
+                            )
+                        },
+                        label = { Text("Aviso 15s antes da troca") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Avisar 30s antes da adrenalina", color = RcpTextPrimary, fontSize = 13.sp)
+                    Switch(
+                        checked = cfg.voiceMessages.adrenalinaPreWarningEnabled,
+                        onCheckedChange = {
+                            onUpdateModeConfig(
+                                editingMode,
+                                cfg.copy(voiceMessages = cfg.voiceMessages.copy(adrenalinaPreWarningEnabled = it))
+                            )
+                        }
+                    )
+                }
+                if (cfg.voiceMessages.adrenalinaPreWarningEnabled) {
+                    OutlinedTextField(
+                        value = cfg.voiceMessages.adrenalinaPreWarningCue,
+                        onValueChange = {
+                            onUpdateModeConfig(
+                                editingMode,
+                                cfg.copy(voiceMessages = cfg.voiceMessages.copy(adrenalinaPreWarningCue = it))
+                            )
+                        },
+                        label = { Text("Aviso 30s antes da adrenalina") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+                OutlinedTextField(
+                    value = cfg.voiceMessages.cycleCompletedCue,
+                    onValueChange = {
+                        onUpdateModeConfig(editingMode, cfg.copy(voiceMessages = cfg.voiceMessages.copy(cycleCompletedCue = it)))
+                    },
+                    label = { Text("Fim de ciclo") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        }
+
+        Text(
+            text = RcpDefaults.DISCLAIMER_TEXT,
+            color = RcpTextSecondary,
+            fontSize = 11.sp,
+            modifier = Modifier.padding(bottom = 12.dp)
+        )
+    }
+}
+
+@Composable
+private fun StepperRow(
+    label: String,
+    valueText: String,
+    onMinus: () -> Unit,
+    onPlus: () -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(label, color = RcpTextPrimary, fontSize = 14.sp)
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(onClick = onMinus, contentPadding = PaddingValues(horizontal = 12.dp)) {
+                Text("-", fontSize = 18.sp, color = RcpTextPrimary)
+            }
+            Text(valueText, color = RcpEmerald, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+            OutlinedButton(onClick = onPlus, contentPadding = PaddingValues(horizontal = 12.dp)) {
+                Text("+", fontSize = 18.sp, color = RcpTextPrimary)
+            }
+        }
+    }
+}
+
+
+================================================================================
+FILE: app/src/main/java/br/com/cronometrorcp/ui/HistoryScreen.kt
+================================================================================
+
+package br.com.cronometrorcp.ui
+
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import br.com.cronometrorcp.model.*
+import br.com.cronometrorcp.ui.theme.*
+
+@Composable
+fun HistoryScreen(
+    history: List<RcpSessionRecord>,
+    onDeleteSession: (String) -> Unit,
+    onBack: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(RcpBackground)
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "Histórico Local de Atendimentos",
+                color = RcpTextPrimary,
+                fontSize = 20.sp,
+                fontWeight = FontWeight.Bold
+            )
+            TextButton(onClick = onBack) {
+                Text("Voltar", color = RcpEmerald, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+            }
+        }
+
+        if (history.isEmpty()) {
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth(),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = "Nenhum atendimento registrado ainda.",
+                    color = RcpTextSecondary,
+                    fontSize = 15.sp
+                )
+            }
+        } else {
+            LazyColumn(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                items(history, key = { it.id }) { session ->
+                    var expanded by remember { mutableStateOf(false) }
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(16.dp),
+                        color = RcpSurface,
+                        border = BorderStroke(1.dp, RcpBorder)
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = session.mode.label,
+                                    color = RcpTextPrimary,
+                                    fontSize = 16.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Text(
+                                    text = formatMmSs(session.totalDurationSeconds),
+                                    color = RcpEmerald,
+                                    fontFamily = FontFamily.Monospace,
+                                    fontSize = 16.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+
+                            Text(
+                                text = "Início: ${session.startedAtIso.take(19).replace("T", " ")}",
+                                color = RcpTextSecondary,
+                                fontSize = 12.sp
+                            )
+
+                            Text(
+                                text = "${session.completedCycles} ciclos · ${session.shocksCount} choques · ${session.medicationsCount} medicações · ${session.compressorSwitchesCount} trocas",
+                                color = RcpTextSecondary,
+                                fontSize = 13.sp
+                            )
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                TextButton(onClick = { expanded = !expanded }) {
+                                    Text(
+                                        if (expanded) "Ocultar eventos" else "Ver ${session.events.size} eventos",
+                                        color = RcpEmerald
+                                    )
+                                }
+                                TextButton(onClick = { onDeleteSession(session.id) }) {
+                                    Text("Excluir", color = RcpRed)
+                                }
+                            }
+
+                            if (expanded) {
+                                HorizontalDivider(color = RcpBorder)
+                                session.events.forEach { ev ->
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        Text(ev.displayLabel, color = RcpTextPrimary, fontSize = 13.sp)
+                                        Text(
+                                            "${formatMmSs(ev.elapsedSeconds)} · Ciclo ${ev.cycleNumber}",
+                                            color = RcpTextSecondary,
+                                            fontFamily = FontFamily.Monospace,
+                                            fontSize = 12.sp
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Text(
+            text = RcpDefaults.DISCLAIMER_TEXT,
+            color = RcpTextSecondary,
+            fontSize = 11.sp
+        )
+    }
+}
+
+
+================================================================================
+FILE: app/src/main/java/br/com/cronometrorcp/viewmodel/RcpViewModel.kt
+================================================================================
+
+package br.com.cronometrorcp.viewmodel
+
+import android.app.Application
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.ServiceConnection
+import android.os.IBinder
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import br.com.cronometrorcp.data.RcpRepository
+import br.com.cronometrorcp.model.*
+import br.com.cronometrorcp.service.RcpForegroundService
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+
+class RcpViewModel(application: Application) : AndroidViewModel(application) {
+
+    private val repository = RcpRepository(application)
+
+    private val _timerState = MutableStateFlow(RcpTimerState())
+    val timerState: StateFlow<RcpTimerState> = _timerState.asStateFlow()
+
+    private val _audioSettings = MutableStateFlow(repository.loadAudioSettings())
+    val audioSettings: StateFlow<AudioSettings> = _audioSettings.asStateFlow()
+
+    private val _modeConfigs = MutableStateFlow(repository.loadModeConfigs())
+    val modeConfigs: StateFlow<Map<RcpMode, ModeConfig>> = _modeConfigs.asStateFlow()
+
+    private val _history = MutableStateFlow(repository.loadHistory())
+    val history: StateFlow<List<RcpSessionRecord>> = _history.asStateFlow()
+
+    private var boundService: RcpForegroundService? = null
+
+    private val connection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+            val local = (service as RcpForegroundService.LocalBinder).getService()
+            boundService = local
+            local.refreshAudioSettings(_audioSettings.value)
+            viewModelScope.launch {
+                local.timerState.collect { state ->
+                    _timerState.value = state
+                }
+            }
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            boundService = null
+        }
+    }
+
+    init {
+        val app = getApplication<Application>()
+        val intent = Intent(app, RcpForegroundService::class.java)
+        app.startService(intent)
+        app.bindService(intent, connection, Context.BIND_AUTO_CREATE)
+    }
+
+    fun selectMode(mode: RcpMode) {
+        boundService?.selectMode(mode)
+    }
+
+    fun startRcp() {
+        boundService?.startRcp()
+    }
+
+    fun togglePause() {
+        val state = _timerState.value
+        if (state.isPaused) boundService?.resumeRcp() else boundService?.pauseRcp()
+    }
+
+    fun finishRcp() {
+        val saved = boundService?.stopAndSaveSession()
+        if (saved != null) {
+            _history.value = repository.loadHistory()
+        }
+    }
+
+    fun registerEvent(type: RcpEventType, customTitle: String? = null) {
+        boundService?.registerEvent(type, customTitle)
+    }
+
+    fun updateAudioSettings(transform: (AudioSettings) -> AudioSettings) {
+        val updated = transform(_audioSettings.value)
+        _audioSettings.value = updated
+        repository.saveAudioSettings(updated)
+        boundService?.refreshAudioSettings(updated)
+    }
+
+    fun toggleMute() {
+        updateAudioSettings { it.copy(isMuted = !it.isMuted) }
+    }
+
+    fun updateModeConfig(mode: RcpMode, config: ModeConfig) {
+        val map = _modeConfigs.value.toMutableMap()
+        map[mode] = config
+        _modeConfigs.value = map
+        repository.saveModeConfigs(map)
+        if (!_timerState.value.isRunning && _timerState.value.activeMode == mode) {
+            _timerState.value = _timerState.value.copy(cycleRemainingSeconds = config.cycleDurationSeconds)
+        }
+    }
+
+    fun deleteSession(sessionId: String) {
+        repository.deleteSession(sessionId)
+        _history.value = repository.loadHistory()
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        try {
+            getApplication<Application>().unbindService(connection)
+        } catch (_: Exception) {
+        }
+    }
+}
+
+
+================================================================================
+FILE: app/src/main/java/br/com/cronometrorcp/data/RcpRepository.kt
+================================================================================
+
+package br.com.cronometrorcp.data
+
+import android.content.Context
+import br.com.cronometrorcp.model.*
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+
+class RcpRepository(private val context: Context) {
+
+    private val prefs = context.getSharedPreferences("rcp_prefs_v2", Context.MODE_PRIVATE)
+    private val historyFile: File get() = File(context.filesDir, "rcp_history.json")
+
+    fun loadAudioSettings(): AudioSettings {
+        val rawSource = prefs.getString("rhythm_source", RhythmAudioSource.METRONOME_ONLY.name)?.let { name ->
+            RhythmAudioSource.entries.find { it.name == name }
+        } ?: RhythmAudioSource.METRONOME_ONLY
+        val resolvedSource = if (rawSource == RhythmAudioSource.MP3_ONLY) {
+            RhythmAudioSource.MP3_AND_METRONOME
+        } else {
+            rawSource
+        }
+        val origBpm = prefs.getInt("mp3_orig_bpm", 110)
+        return AudioSettings(
+            voiceVolume = prefs.getFloat("voice_vol_v2", 0.85f),
+            metronomeVolume = prefs.getFloat("metro_vol_v2", 1.0f).coerceIn(0f, 1.0f),
+            mp3Volume = prefs.getFloat("mp3_vol_v2", 0.55f),
+            alarmVolume = prefs.getFloat("alarm_vol_v2", 0.85f),
+            isMuted = prefs.getBoolean("is_muted", false),
+            rhythmSource = resolvedSource,
+            mp3UriString = prefs.getString("mp3_uri", null),
+            mp3DisplayName = prefs.getString("mp3_name", null),
+            mp3OriginalBpm = origBpm,
+            mp3ExactBpm = prefs.getFloat("mp3_exact_bpm", origBpm.toFloat()),
+            mp3BeatOffsetMs = prefs.getInt("mp3_beat_offset_ms", 0),
+            mp3TrimStartMs = prefs.getInt("mp3_trim_start_ms", 0),
+            mp3LoopEndMs = prefs.getInt("mp3_loop_end_ms", 0),
+            mp3SyncSpeed = prefs.getBoolean("mp3_sync_speed_v2", true),
+            followMusicRhythm = prefs.getBoolean("follow_music_rhythm", true)
+        )
+    }
+
+    fun saveAudioSettings(settings: AudioSettings) {
+        val safeSource = if (settings.rhythmSource == RhythmAudioSource.MP3_ONLY) {
+            RhythmAudioSource.MP3_AND_METRONOME
+        } else {
+            settings.rhythmSource
+        }
+        prefs.edit()
+            .putFloat("voice_vol_v2", settings.voiceVolume)
+            .putFloat("metro_vol_v2", settings.metronomeVolume.coerceIn(0f, 1.0f))
+            .putFloat("mp3_vol_v2", settings.mp3Volume)
+            .putFloat("alarm_vol_v2", settings.alarmVolume)
+            .putBoolean("is_muted", settings.isMuted)
+            .putString("rhythm_source", safeSource.name)
+            .putString("mp3_uri", settings.mp3UriString)
+            .putString("mp3_name", settings.mp3DisplayName)
+            .putInt("mp3_orig_bpm", settings.mp3OriginalBpm)
+            .putFloat("mp3_exact_bpm", settings.mp3ExactBpm)
+            .putInt("mp3_beat_offset_ms", settings.mp3BeatOffsetMs)
+            .putInt("mp3_trim_start_ms", settings.mp3TrimStartMs)
+            .putInt("mp3_loop_end_ms", settings.mp3LoopEndMs)
+            .putBoolean("mp3_sync_speed_v2", settings.mp3SyncSpeed)
+            .putBoolean("follow_music_rhythm", settings.followMusicRhythm)
+            .apply()
+    }
+
+    fun loadSelectedMode(): RcpMode {
+        val raw = prefs.getString("selected_mode", RcpMode.ADULTO_ACLS.name)
+        return RcpMode.entries.find { it.name == raw } ?: RcpMode.ADULTO_ACLS
+    }
+
+    fun saveSelectedMode(mode: RcpMode) {
+        prefs.edit().putString("selected_mode", mode.name).apply()
+    }
+
+    fun loadModeConfigs(): Map<RcpMode, ModeConfig> {
+        val defaults = RcpDefaults.defaultConfigs().toMutableMap()
+        val raw = prefs.getString("mode_configs_json_v4", null) ?: return defaults
+        return try {
+            val root = JSONObject(raw)
+            RcpMode.entries.forEach { mode ->
+                val obj = root.optJSONObject(mode.name) ?: return@forEach
+                val base = defaults[mode]!!
+                val msgObj = obj.optJSONObject("voiceMessages")
+                val remObj = obj.optJSONObject("reminders")
+                val amioObj = obj.optJSONObject("amiodaronaProtocol")
+                val fiveObj = obj.optJSONObject("fiveHsTs")
+
+                val reminders = base.reminders.toMutableMap()
+                ReminderKey.entries.forEach { key ->
+                    remObj?.optJSONObject(key.name)?.let { r ->
+                        reminders[key] = VoiceReminderConfig(
+                            enabled = r.optBoolean("enabled", reminders[key]!!.enabled),
+                            intervalSeconds = r.optInt("intervalSeconds", reminders[key]!!.intervalSeconds),
+                            message = r.optString("message", reminders[key]!!.message)
+                        )
+                    }
+                }
+                defaults[mode] = base.copy(
+                    cycleDurationSeconds = obj.optInt("cycleDurationSeconds", base.cycleDurationSeconds),
+                    metronomeBpm = obj.optInt("metronomeBpm", base.metronomeBpm),
+                    pattern = CompressionPattern.entries.find {
+                        it.name == obj.optString("pattern", base.pattern.name)
+                    } ?: base.pattern,
+                    rhythmCheckIntervalSeconds = obj.optInt("rhythmCheckIntervalSeconds", base.rhythmCheckIntervalSeconds),
+                    continuousVentilationIntervalSeconds = obj.optInt(
+                        "continuousVentilationIntervalSeconds",
+                        base.continuousVentilationIntervalSeconds
+                    ),
+                    announceTimeEvery10s = obj.optBoolean("announceTimeEvery10s", base.announceTimeEvery10s),
+                    voiceMessages = if (msgObj != null) {
+                        val savedPreCue = msgObj.optString("compressorPreWarningCue", base.voiceMessages.compressorPreWarningCue)
+                        VoiceMessages(
+                            compressionsCue = msgObj.optString("compressionsCue", base.voiceMessages.compressionsCue),
+                            ventilationsCue = msgObj.optString("ventilationsCue", base.voiceMessages.ventilationsCue),
+                            thirtySecondsCue = msgObj.optString("thirtySecondsCue", base.voiceMessages.thirtySecondsCue),
+                            compressorPreWarningEnabled = msgObj.optBoolean("compressorPreWarningEnabled", base.voiceMessages.compressorPreWarningEnabled),
+                            compressorPreWarningCue = if (savedPreCue == "Dez segundos para trocar o compressor.") {
+                                base.voiceMessages.compressorPreWarningCue
+                            } else savedPreCue,
+                            adrenalinaPreWarningEnabled = msgObj.optBoolean("adrenalinaPreWarningEnabled", base.voiceMessages.adrenalinaPreWarningEnabled),
+                            adrenalinaPreWarningCue = msgObj.optString("adrenalinaPreWarningCue", base.voiceMessages.adrenalinaPreWarningCue),
+                            cycleCompletedCue = msgObj.optString("cycleCompletedCue", base.voiceMessages.cycleCompletedCue)
+                        )
+                    } else base.voiceMessages,
+                    reminders = reminders,
+                    amiodaronaProtocol = if (amioObj != null) AmiodaronaProtocolConfig(
+                        enabled = amioObj.optBoolean("enabled", base.amiodaronaProtocol.enabled),
+                        firstDoseAfterShock = amioObj.optInt("firstDoseAfterShock", base.amiodaronaProtocol.firstDoseAfterShock),
+                        secondDoseAfterShock = amioObj.optInt("secondDoseAfterShock", base.amiodaronaProtocol.secondDoseAfterShock),
+                        firstDoseMessage = amioObj.optString("firstDoseMessage", base.amiodaronaProtocol.firstDoseMessage),
+                        secondDoseMessage = amioObj.optString("secondDoseMessage", base.amiodaronaProtocol.secondDoseMessage)
+                    ) else base.amiodaronaProtocol,
+                    fiveHsTs = if (fiveObj != null) {
+                        val savedFiveInit = fiveObj.optString("initialPromptMessage", base.fiveHsTs.initialPromptMessage)
+                        FiveHsTsConfig(
+                            enabled = fiveObj.optBoolean("enabled", base.fiveHsTs.enabled),
+                            initialPromptDelaySeconds = fiveObj.optInt("initialPromptDelaySeconds", base.fiveHsTs.initialPromptDelaySeconds),
+                            tipIntervalSeconds = fiveObj.optInt("tipIntervalSeconds", base.fiveHsTs.tipIntervalSeconds),
+                            initialPromptMessage = if (savedFiveInit == "Lembrete de causas reversíveis: avalie os cinco agás e os cinco tês durante a RCP.") {
+                                base.fiveHsTs.initialPromptMessage
+                            } else savedFiveInit
+                        )
+                    } else base.fiveHsTs
+                )
+            }
+            defaults
+        } catch (_: Exception) {
+            defaults
+        }
+    }
+
+    fun saveModeConfigs(configs: Map<RcpMode, ModeConfig>) {
+        val root = JSONObject()
+        configs.forEach { (mode, cfg) ->
+            val msgObj = JSONObject().apply {
+                put("compressionsCue", cfg.voiceMessages.compressionsCue)
+                put("ventilationsCue", cfg.voiceMessages.ventilationsCue)
+                put("thirtySecondsCue", cfg.voiceMessages.thirtySecondsCue)
+                put("compressorPreWarningEnabled", cfg.voiceMessages.compressorPreWarningEnabled)
+                put("compressorPreWarningCue", cfg.voiceMessages.compressorPreWarningCue)
+                put("adrenalinaPreWarningEnabled", cfg.voiceMessages.adrenalinaPreWarningEnabled)
+                put("adrenalinaPreWarningCue", cfg.voiceMessages.adrenalinaPreWarningCue)
+                put("cycleCompletedCue", cfg.voiceMessages.cycleCompletedCue)
+            }
+            val remObj = JSONObject()
+            cfg.reminders.forEach { (key, r) ->
+                remObj.put(key.name, JSONObject().apply {
+                    put("enabled", r.enabled)
+                    put("intervalSeconds", r.intervalSeconds)
+                    put("message", r.message)
+                })
+            }
+            val amioObj = JSONObject().apply {
+                put("enabled", cfg.amiodaronaProtocol.enabled)
+                put("firstDoseAfterShock", cfg.amiodaronaProtocol.firstDoseAfterShock)
+                put("secondDoseAfterShock", cfg.amiodaronaProtocol.secondDoseAfterShock)
+                put("firstDoseMessage", cfg.amiodaronaProtocol.firstDoseMessage)
+                put("secondDoseMessage", cfg.amiodaronaProtocol.secondDoseMessage)
+            }
+            val fiveObj = JSONObject().apply {
+                put("enabled", cfg.fiveHsTs.enabled)
+                put("initialPromptDelaySeconds", cfg.fiveHsTs.initialPromptDelaySeconds)
+                put("tipIntervalSeconds", cfg.fiveHsTs.tipIntervalSeconds)
+                put("initialPromptMessage", cfg.fiveHsTs.initialPromptMessage)
+            }
+            root.put(mode.name, JSONObject().apply {
+                put("cycleDurationSeconds", cfg.cycleDurationSeconds)
+                put("metronomeBpm", cfg.metronomeBpm)
+                put("pattern", cfg.pattern.name)
+                put("rhythmCheckIntervalSeconds", cfg.rhythmCheckIntervalSeconds)
+                put("continuousVentilationIntervalSeconds", cfg.continuousVentilationIntervalSeconds)
+                put("announceTimeEvery10s", cfg.announceTimeEvery10s)
+                put("voiceMessages", msgObj)
+                put("reminders", remObj)
+                put("amiodaronaProtocol", amioObj)
+                put("fiveHsTs", fiveObj)
+            })
+        }
+        prefs.edit().putString("mode_configs_json_v4", root.toString()).apply()
+    }
+
+    fun loadHistory(): List<RcpSessionRecord> {
+        if (!historyFile.exists()) return emptyList()
+        return try {
+            val arr = JSONArray(historyFile.readText())
+            (0 until arr.length()).map { idx ->
+                val o = arr.getJSONObject(idx)
+                val eventsArr = o.optJSONArray("events") ?: JSONArray()
+                val events = (0 until eventsArr.length()).map { eIdx ->
+                    val eo = eventsArr.getJSONObject(eIdx)
+                    val rawType = eo.getString("type")
+                    val resolvedType = if (rawType == "EPINEFRINA") {
+                        RcpEventType.ADRENALINA
+                    } else {
+                        RcpEventType.entries.find { it.name == rawType } ?: RcpEventType.PERSONALIZADO
+                    }
+                    RcpEventRecord(
+                        id = eo.getString("id"),
+                        type = resolvedType,
+                        customTitle = eo.optString("customTitle").takeIf { it.isNotBlank() }
+                            ?: if (resolvedType != RcpEventType.PERSONALIZADO) null else rawType,
+                        elapsedSeconds = eo.getInt("elapsedSeconds"),
+                        cycleNumber = eo.getInt("cycleNumber"),
+                        timestampIso = eo.getString("timestampIso")
+                    )
+                }
+                RcpSessionRecord(
+                    id = o.getString("id"),
+                    startedAtIso = o.getString("startedAtIso"),
+                    mode = RcpMode.valueOf(o.getString("mode")),
+                    totalDurationSeconds = o.getInt("totalDurationSeconds"),
+                    completedCycles = o.getInt("completedCycles"),
+                    shocksCount = o.getInt("shocksCount"),
+                    medicationsCount = o.getInt("medicationsCount"),
+                    compressorSwitchesCount = o.getInt("compressorSwitchesCount"),
+                    events = events
+                )
+            }
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    fun appendSession(record: RcpSessionRecord) {
+        val current = loadHistory().toMutableList()
+        current.add(0, record)
+        saveHistoryList(current)
+    }
+
+    fun deleteSession(sessionId: String) {
+        val filtered = loadHistory().filterNot { it.id == sessionId }
+        saveHistoryList(filtered)
+    }
+
+    private fun saveHistoryList(list: List<RcpSessionRecord>) {
+        val arr = JSONArray()
+        list.forEach { s ->
+            val eventsArr = JSONArray()
+            s.events.forEach { e ->
+                eventsArr.put(JSONObject().apply {
+                    put("id", e.id)
+                    put("type", e.type.name)
+                    put("customTitle", e.customTitle ?: "")
+                    put("elapsedSeconds", e.elapsedSeconds)
+                    put("cycleNumber", e.cycleNumber)
+                    put("timestampIso", e.timestampIso)
+                })
+            }
+            arr.put(JSONObject().apply {
+                put("id", s.id)
+                put("startedAtIso", s.startedAtIso)
+                put("mode", s.mode.name)
+                put("totalDurationSeconds", s.totalDurationSeconds)
+                put("completedCycles", s.completedCycles)
+                put("shocksCount", s.shocksCount)
+                put("medicationsCount", s.medicationsCount)
+                put("compressorSwitchesCount", s.compressorSwitchesCount)
+                put("events", eventsArr)
+            })
+        }
+        historyFile.writeText(arr.toString())
+    }
+}
+
+
+================================================================================
+FILE: app/src/main/java/br/com/cronometrorcp/MainActivity.kt
+================================================================================
+
+package br.com.cronometrorcp
+
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.provider.OpenableColumns
+import android.view.WindowManager
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.viewModels
+import androidx.compose.runtime.*
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
+import br.com.cronometrorcp.audio.Mp3BeatAnalyzer
+import br.com.cronometrorcp.model.RhythmAudioSource
+import br.com.cronometrorcp.ui.HistoryScreen
+import br.com.cronometrorcp.ui.MainScreen
+import br.com.cronometrorcp.ui.SettingsScreen
+import br.com.cronometrorcp.ui.theme.RcpTheme
+import br.com.cronometrorcp.viewmodel.RcpViewModel
+import kotlinx.coroutines.launch
+
+private enum class AppRoute { MAIN, SETTINGS, HISTORY }
+
+class MainActivity : ComponentActivity() {
+
+    private val viewModel: RcpViewModel by viewModels()
+
+    private val notificationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { }
+
+    private val mp3PickerLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            try {
+                contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            } catch (_: Exception) {
+            }
+            val displayName = resolveDisplayName(uri)
+            val newUriStr = uri.toString()
+            viewModel.updateAudioSettings { current ->
+                current.copy(
+                    mp3UriString = newUriStr,
+                    mp3DisplayName = displayName,
+                    mp3BeatOffsetMs = 0,
+                    mp3TrimStartMs = 0,
+                    mp3LoopEndMs = 0,
+                    mp3SyncSpeed = true,
+                    followMusicRhythm = true,
+                    rhythmSource = if (current.rhythmSource == RhythmAudioSource.METRONOME_ONLY) {
+                        RhythmAudioSource.MP3_AND_METRONOME
+                    } else {
+                        current.rhythmSource
+                    }
+                )
+            }
+            lifecycleScope.launch {
+                val analysis = Mp3BeatAnalyzer.analyzeUri(this@MainActivity, uri)
+                viewModel.updateAudioSettings { current ->
+                    if (current.mp3UriString != newUriStr) return@updateAudioSettings current
+                    current.copy(
+                        mp3OriginalBpm = analysis.detectedBpm,
+                        mp3ExactBpm = analysis.exactBpm,
+                        mp3BeatOffsetMs = analysis.beatOffsetMs,
+                        mp3TrimStartMs = analysis.trimStartMs,
+                        mp3LoopEndMs = analysis.loopEndMs,
+                        mp3SyncSpeed = true,
+                        followMusicRhythm = true
+                    )
+                }
+            }
+        }
+    }
+
+    private fun resolveDisplayName(uri: Uri): String {
+        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) {
+                val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (idx >= 0) return cursor.getString(idx) ?: "faixa_ritmo.mp3"
+            }
+        }
+        return uri.lastPathSegment ?: "faixa_ritmo.mp3"
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val granted = ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.POST_NOTIFICATIONS
+            ) == PackageManager.PERMISSION_GRANTED
+            if (!granted) {
+                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
+
+        setContent {
+            RcpTheme {
+                val timerState by viewModel.timerState.collectAsState()
+                val audioSettings by viewModel.audioSettings.collectAsState()
+                val modeConfigs by viewModel.modeConfigs.collectAsState()
+                val history by viewModel.history.collectAsState()
+
+                var route by remember { mutableStateOf(AppRoute.MAIN) }
+
+                LaunchedEffect(timerState.isRunning) {
+                    if (timerState.isRunning) {
+                        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                        route = AppRoute.MAIN
+                    } else {
+                        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    }
+                }
+
+                when (route) {
+                    AppRoute.MAIN -> MainScreen(
+                        timerState = timerState,
+                        audioSettings = audioSettings,
+                        activeConfig = modeConfigs[timerState.activeMode]!!,
+                        onSelectMode = viewModel::selectMode,
+                        onStartRcp = viewModel::startRcp,
+                        onTogglePause = viewModel::togglePause,
+                        onFinishRcp = viewModel::finishRcp,
+                        onToggleMute = viewModel::toggleMute,
+                        onUpdateAudio = viewModel::updateAudioSettings,
+                        onPickMp3File = { mp3PickerLauncher.launch(arrayOf("audio/*")) },
+                        onRegisterEvent = viewModel::registerEvent,
+                        onOpenSettings = { if (!timerState.isRunning) route = AppRoute.SETTINGS },
+                        onOpenHistory = { if (!timerState.isRunning) route = AppRoute.HISTORY }
+                    )
+
+                    AppRoute.SETTINGS -> SettingsScreen(
+                        modeConfigs = modeConfigs,
+                        audioSettings = audioSettings,
+                        onUpdateModeConfig = viewModel::updateModeConfig,
+                        onUpdateAudio = viewModel::updateAudioSettings,
+                        onPickMp3File = { mp3PickerLauncher.launch(arrayOf("audio/*")) },
+                        onRemoveMp3File = {
+                            viewModel.updateAudioSettings {
+                                it.copy(
+                                    mp3UriString = null,
+                                    mp3DisplayName = null,
+                                    rhythmSource = RhythmAudioSource.METRONOME_ONLY
+                                )
+                            }
+                        },
+                        onBack = { route = AppRoute.MAIN }
+                    )
+
+                    AppRoute.HISTORY -> HistoryScreen(
+                        history = history,
+                        onDeleteSession = viewModel::deleteSession,
+                        onBack = { route = AppRoute.MAIN }
+                    )
+                }
+            }
+        }
+    }
+}
+
+
+================================================================================
+FILE: app/src/main/java/br/com/cronometrorcp/ui/theme/Theme.kt
+================================================================================
+
+package br.com.cronometrorcp.ui.theme
+
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.darkColorScheme
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.graphics.Color
+
+val RcpBackground = Color(0xFF090B0E)
+val RcpSurface = Color(0xFF12161D)
+val RcpSurfaceElevated = Color(0xFF1A202A)
+val RcpBorder = Color(0xFF28313E)
+val RcpTextPrimary = Color(0xFFF4F6F8)
+val RcpTextSecondary = Color(0xFF9BA7B8)
+val RcpEmerald = Color(0xFF10B981)
+val RcpRed = Color(0xFFDC2626)
+val RcpAmber = Color(0xFFF59E0B)
+val RcpBlue = Color(0xFF2563EB)
+val RcpTeal = Color(0xFF0D9488)
+
+private val DarkColors = darkColorScheme(
+    primary = RcpEmerald,
+    secondary = RcpTeal,
+    tertiary = RcpAmber,
+    background = RcpBackground,
+    surface = RcpSurface,
+    surfaceVariant = RcpSurfaceElevated,
+    onPrimary = Color.Black,
+    onBackground = RcpTextPrimary,
+    onSurface = RcpTextPrimary,
+    error = RcpRed
+)
+
+@Composable
+fun RcpTheme(content: @Composable () -> Unit) {
+    MaterialTheme(
+        colorScheme = DarkColors,
+        content = content
+    )
+}
+
+
+================================================================================
+FILE: app/build.gradle.kts
+================================================================================
+
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
+}
+
+android {
+    namespace = "br.com.cronometrorcp"
+    compileSdk = 35
+
+    defaultConfig {
+        applicationId = "br.com.cronometrorcp"
+        minSdk = 26
+        targetSdk = 35
+        versionCode = 1
+        versionName = "1.0.0"
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+
+    buildFeatures {
+        compose = true
+    }
+}
+
+dependencies {
+    val composeBom = platform("androidx.compose:compose-bom:2025.02.00")
+    implementation(composeBom)
+
+    implementation("androidx.core:core-ktx:1.15.0")
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
+    implementation("androidx.activity:activity-compose:1.10.1")
+
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.ui:ui-graphics")
+    implementation("androidx.compose.ui:ui-tooling-preview")
+    implementation("androidx.compose.material3:material3")
+    implementation("androidx.compose.material:material-icons-extended")
+
+    implementation("androidx.media:media:1.7.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+}
+
+
+================================================================================
+FILE: README.md
+================================================================================
+
+# Cronômetro RCP com Áudio — Projeto Nativo Android (Kotlin + Jetpack Compose)
+
+Ferramenta de apoio ao treinamento e à organização de RCP. Funciona **100% offline**, sem acesso à internet e sem APIs externas. Não toma decisões clínicas nem substitui protocolos institucionais.
+
+## Arquitetura Implementada
+
+- **Linguagem & UI**: Kotlin + Jetpack Compose (Material 3 Dark, alto contraste para uso em sala escura ou treinamento).
+- **Serviço em Primeiro Plano (`mediaPlayback`)**: `RcpForegroundService` mantém o cronômetro (baseado em `SystemClock.elapsedRealtime()` para zero deriva), o metrônomo PCM e os alertas de voz funcionando mesmo com a tela apagada, com notificação persistente e `PARTIAL_WAKE_LOCK`.
+- **Tela Mantida Acesa**: `FLAG_KEEP_SCREEN_ON` gerenciado dinamicamente na `MainActivity` durante uso ativo.
+- **Áudio e Voz Offline (`RcpAudioEngine`)**:
+  - `TextToSpeech` configurado para `Locale("pt", "BR")` com fallback automático para a voz padrão do sistema caso `pt-BR` esteja indisponível, além de fallback acústico por `AudioTrack`.
+  - Solicitação de foco de áudio (`AudioFocusRequest`) com `AudioAttributes.CONTENT_TYPE_SPEECH`.
+  - Metrônomo e alarmes gerados por síntese PCM (`AudioTrack`) 100% offline, com volumes independentes para **Voz**, **Metrônomo** e **Alarmes**, além do botão **Silenciar áudio**.
+- **Modos Independentes**: Adulto — ACLS, Pediátrico — PALS e Neonatal, cada um com configuração própria de ciclo, BPM, relação compressão/ventilação, intervalos de checagem, lembretes de medicação e mensagens de voz.
+- **Persistência Local**: Histórico completo de atendimentos salvo localmente em JSON privado do app (`context.filesDir`), sem rede.
+
+## Como Compilar no Android Studio
+
+1. Crie um novo projeto Empty Activity (Jetpack Compose) no Android Studio (API mínima 26, Target/Compile SDK 35) com pacote `br.com.cronometrorcp`.
+2. Copie os arquivos desta pasta para `app/` preservando a estrutura de pacotes.
+3. Sincronize o Gradle e execute em um dispositivo físico ou emulador Android.
+
